@@ -36,6 +36,20 @@ npm run dev
 
 The app auto-creates `~/.lineup/lineup.db` on first launch — no Python required for basic project management.
 
+### Try the demo (with sample data)
+
+To explore the app without touching your real data, launch with an isolated data dir and load the seed file:
+
+```bash
+cd lineup-public
+LINEUP_DATA_DIR=$(pwd)/demo-data npm --prefix frontend run dev  # first run creates empty DB
+# Ctrl+C, then:
+sqlite3 demo-data/lineup.db < demo-data/seed.sql
+LINEUP_DATA_DIR=$(pwd)/demo-data npm --prefix frontend run dev  # relaunch with data
+```
+
+The `LINEUP_DATA_DIR` env var redirects all lineup state (DB, virtual project folders, `.mcp.json`) into a sandbox directory. Useful for screenshots, testing, and running multiple instances (work vs personal).
+
 ### Troubleshooting native modules
 
 Electron uses a different Node ABI than system Node, so `better-sqlite3` and `node-pty` must be rebuilt against Electron's version. The `postinstall` script does this automatically, but if you see `NODE_MODULE_VERSION` errors:

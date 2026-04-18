@@ -16,9 +16,7 @@ const nativeRequire = createRequire(import.meta.url || __filename)
 // Path to the lineup Python CLI. Uses uv to run in the project's venv.
 const LINEUP_ROOT = join(homedir(), 'lineup')  // TODO: make configurable
 
-// Root of the virtual project folders that the per-project "main agent"
-// claude sessions run inside. See syncProjectVirtualFolder().
-const VIRTUAL_PROJECTS_ROOT = join(homedir(), '.lineup', 'projects')
+import { LINEUP_HOME, VIRTUAL_PROJECTS_ROOT, WAL_PATH, SHARED_MCP_PATH } from './paths'
 
 /**
  * Turn a project name into a filesystem-safe slug for the virtual folder.
@@ -346,7 +344,7 @@ function syncProjectVirtualFolder(project: { id: number; name: string; descripti
 
   // ── .mcp.json ────────────────────────────────────────────────
   // Inherit from ~/.lineup/.mcp.json if present, otherwise leave alone.
-  const sharedMcp = join(homedir(), '.lineup', '.mcp.json')
+  const sharedMcp = SHARED_MCP_PATH
   if (existsSync(sharedMcp)) {
     try {
       writeFileSync(join(dir, '.mcp.json'), readFileSync(sharedMcp, 'utf8'), 'utf8')
@@ -1685,12 +1683,12 @@ function registerIpc(): void {
       ${TASK_VIEW_SELECT}
         AND t.status NOT IN ('done', 'cancelled')
         AND (
-          (t.due_at IS NOT NULL AND date(t.due_at) <= date('now'))
+          (t.due_at IS NOT NULL AND date(t.due_at) <= date('now', 'localtime'))
           OR (
             t.reminder_every_days IS NOT NULL
             AND (
               t.last_reminded_at IS NULL
-              OR date(t.last_reminded_at, '+' || t.reminder_every_days || ' days') <= date('now')
+              OR date(t.last_reminded_at, '+' || t.reminder_every_days || ' days') <= date('now', 'localtime')
             )
           )
         )
@@ -2082,7 +2080,7 @@ app.whenReady().then(() => {
   // an MCP tool (or any other process) mutates the DB behind our back.
   // WAL file changes on every write; main DB file only changes on
   // checkpoints, so WAL is the signal we want.
-  const walPath = join(homedir(), '.lineup', 'lineup.db-wal')
+  const walPath = WAL_PATH
   let lastFireAt = 0
   watchFile(walPath, { interval: 800 }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return

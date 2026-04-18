@@ -25,3 +25,8 @@ frontend/dist/
 
 # Claude Code local settings
 .claude/
+
+# Demo runtime data (regenerate with seed.sql)
+demo-data/*.db
+demo-data/*.db-wal
+demo-data/*.db-shm

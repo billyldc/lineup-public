@@ -100,7 +100,11 @@ export interface Agent {
   message_count?: number
 }
 
-const LINEUP_HOME = join(homedir(), '.lineup')
+// Same logic as main/paths.ts (preload runs in its own context and
+// can't import from main/). Keep in sync: respect LINEUP_DATA_DIR env var.
+const LINEUP_HOME = process.env.LINEUP_DATA_DIR
+  ? process.env.LINEUP_DATA_DIR
+  : join(homedir(), '.lineup')
 
 const api = {
   /** The lineup data root (~/.lineup/). Renderer uses this for default agent cwd. */

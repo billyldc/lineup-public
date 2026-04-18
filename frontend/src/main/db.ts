@@ -8,16 +8,14 @@
  * required for basic project management.
  */
 
-import { join } from 'path'
-import { homedir } from 'os'
 import { existsSync, mkdirSync } from 'fs'
 import { createRequire } from 'module'
+import { LINEUP_HOME, DB_PATH } from './paths'
 
 const nativeRequire = createRequire(import.meta.url || __filename)
 const Database = nativeRequire('better-sqlite3')
 
-const DB_DIR = join(homedir(), '.lineup')
-const DB_PATH = join(DB_DIR, 'lineup.db')
+const DB_DIR = LINEUP_HOME
 
 /** Core schema — created on first launch. Matches lineup/store.py SCHEMA. */
 const SCHEMA = `
