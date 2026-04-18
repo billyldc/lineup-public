@@ -4,6 +4,28 @@ A project management desktop app with Miller-column navigation, task/step hierar
 
 Built with Electron + React + TypeScript + Tailwind CSS + better-sqlite3.
 
+## Screenshots
+
+**Today view** — active tasks due today, grouped with parent project + color + priority.
+
+![Today view](docs/screenshots/today.png)
+
+**Eisenhower matrix** — four quadrants by importance × urgency. Tasks auto-flagged urgent when due ≤ 3 days.
+
+![Eisenhower matrix](docs/screenshots/eisenhower.png)
+
+**Inbox** — orphan tasks from Quick-Add (⌘N) live here until you drag them into a project.
+
+![Inbox](docs/screenshots/inbox.png)
+
+**Project detail + Inspector** — sub-projects, tasks, linked files/URLs, progress, color, pin-to-sidebar, main agent launcher.
+
+![Project detail](docs/screenshots/project-detail.png)
+
+**Embedded Claude agent** — per-project terminal running Claude Code with auto-generated CLAUDE.md and MCP tools for structured task management.
+
+![Agent integration](docs/screenshots/agent.png)
+
 ## Features
 
 **Project management**
