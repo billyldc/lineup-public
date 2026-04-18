@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Lineup runtime
+.chat/
+
+# IDE
+.idea/
+.vscode/
+
+# Node
+node_modules/
+
+# Electron build output
+frontend/out/
+frontend/dist/
+
+# Claude Code local settings
+.claude/
