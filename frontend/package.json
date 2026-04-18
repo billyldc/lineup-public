@@ -8,7 +8,7 @@
     "dev": "electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "postinstall": "electron-rebuild -f -w better-sqlite3 node-pty 2>/dev/null; chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
+    "postinstall": "electron-rebuild -f -o better-sqlite3 && (electron-rebuild -f -o node-pty || echo 'WARN: node-pty rebuild failed; embedded terminal disabled. Fix: pip3 install setuptools && npx electron-rebuild -f -o node-pty'); chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
     "dist": "electron-vite build && electron-builder"
   },
   "devDependencies": {

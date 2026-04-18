@@ -36,6 +36,23 @@ npm run dev
 
 The app auto-creates `~/.lineup/lineup.db` on first launch — no Python required for basic project management.
 
+### Troubleshooting native modules
+
+Electron uses a different Node ABI than system Node, so `better-sqlite3` and `node-pty` must be rebuilt against Electron's version. The `postinstall` script does this automatically, but if you see `NODE_MODULE_VERSION` errors:
+
+```bash
+npx electron-rebuild -f -o better-sqlite3
+```
+
+**node-pty requires Python with `distutils`.** On Python 3.12+ (where distutils was removed), you'll need:
+
+```bash
+pip3 install setuptools
+npx electron-rebuild -f -o node-pty
+```
+
+If `node-pty` fails to build, the embedded terminal / chat panel will be disabled but the rest of the app still works.
+
 ### Optional: Python backend (for CLI + MCP + agent features)
 
 ```bash
