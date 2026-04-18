@@ -4,7 +4,7 @@ Objects of type `obsidian` are markdown files inside Obsidian vaults.
 
 ## How to identify
 
-- Targets are filesystem paths (e.g. `/Users/x/Desktop/科研/科研笔记/note.md`)
+- Targets are filesystem paths (e.g. `/Users/x/Documents/notes/my-note.md`)
 - They live inside an Obsidian vault (a directory containing `.obsidian/`)
 - Display path looks like `obsidian://VaultName/relative/path`
 

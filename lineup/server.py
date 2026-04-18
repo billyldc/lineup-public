@@ -30,7 +30,7 @@ def lineup_create_project(
        **没有**同名的 project / task / step 已经存在；如果存在就优先复用它，
        不要新建。
     2. **弄清楚用户要的到底是 project、task 还是 step**。这三个是完全不同的层级：
-       - `project` = 长期工作区，可以嵌套 project 和 task（例如 `review`, `research`, `实习`）
+       - `project` = 长期工作区，可以嵌套 project 和 task（例如 `research`, `work`, `personal`）
        - `task` = 一次具体的工作单元，可以包含 step；task 之间是并行的
        - `step` = task 内的顺序 checklist 步骤，只能由 agent 建
        用户如果说"子项目"/"子任务"/"步骤"模糊不清（例如只说"新建一个"），
@@ -57,7 +57,7 @@ def lineup_create_task(
 ) -> str:
     """在一个 project 下新建一个 task。
 
-    task 是一次具体工作的单元（例如"审稿 FOCS26 paper 42"、"投简历到 XX 公司"）。
+    task 是一次具体工作的单元（例如 "review paper X", "prepare presentation Y"）。
     task 之间默认**并行** —— 多个 task 可以同时进行，互不阻塞。如果你要把一次工作
     拆成必须按顺序完成的步骤，把这些步骤建成 **step**（用 `lineup_create_step`），
     不要建成多个 task。
@@ -262,7 +262,7 @@ def lineup_dispatch_agent(
     这是通用 agent 跨文件夹调度的核心工具。用法举例：
 
         lineup_dispatch_agent(
-            folder="~/homepage",
+            folder="~/my-website",
             prompt="请更新 CV 里的 Recent Projects 部分，加入最近一个月的项目"
         )
 
@@ -374,7 +374,7 @@ def lineup_progress_set(
 
     percent: 进度百分比(0-100)，传 -1 清除进度
     project: 项目名称(可选,默认为当前活跃项目)
-    note: 进度备注（可选，如 "等待审稿意见"、"初稿完成"）
+    note: 进度备注（可选，如 "waiting for feedback"、"初稿完成"）
     """
     return store.progress_set(percent, project, note=note)
 
@@ -710,7 +710,7 @@ def lineup_todoist_link(todoist_ref: str, lineup_name: str) -> str:
     lineup_name: lineup 项目名称（必须已存在）
 
     用于名字不一致但语义对应的情况。例如：
-      lineup_todoist_link("科研", "research")
+      lineup_todoist_link("my-project", "todoist-project")
       lineup_todoist_link("自动化", "productivity")
     """
     from lineup.plugins import todoist as td_plugin

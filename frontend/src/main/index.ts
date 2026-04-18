@@ -133,8 +133,8 @@ function buildInventoryAndSkills(
 
 lineup 里只有三种层级：
 
-- **project**：长期工作区（例如 \`review\`, \`research\`, \`实习\`）。可以嵌套 project 和 task。有 main agent 和 objects/。
-- **task**：一次具体工作（例如"审稿 FOCS26 paper 42"）。*parallel* — 和兄弟 task 互不阻塞。每个 task 可以有自己的 agent 和 objects/。
+- **project**：长期工作区（例如 \`research\`, \`work\`, \`personal\`）。可以嵌套 project 和 task。有 main agent 和 objects/。
+- **task**：一次具体工作（例如 "review paper X", "apply to company Y"）。*parallel* — 和兄弟 task 互不阻塞。每个 task 可以有自己的 agent 和 objects/。
 - **step**：task 内部的顺序 checklist。*sequential* — 前一个没做完后一个就被 lock。只有 agent 能创建。
 
 ### 创建任何 project / task / step 之前，按顺序做这三件事：
@@ -157,10 +157,10 @@ lineup 里只有三种层级：
 
 ### 常见错误（不要犯）
 
-- ❌ 用户说"放到 FOCS2026review 这个新建的子项目下面" → 你直接建 project。应该先 \`list_children\` 看是不是已经有一个 FOCS 相关的 task，如果有就问用户是不是指它。
+- ❌ 用户说"放到 project-X 这个新建的子项目下面" → 你直接建 project。应该先 \`list_children\` 看是不是已经有一个 同名或相似的 task，如果有就问用户是不是指它。
 - ❌ 用户说"把 step-wise 的流程也新建进去" → 你用 \`lineup_todo_add\`。应该用 \`lineup_create_task\` + 多次 \`lineup_create_step\`。
 - ❌ 用户说"子项目" → 你二话不说建 project。应该问："你是要 project 还是 task？"（多数情况下用户指的是 task）。
-- ❌ 用户说"FOCS26 ddl 是 5 月 14 日" → 你想方设法在项目上加 due。应该用 \`lineup_set_task_meta('FOCS26review', due_at='2026-05-14')\` 设到对应的 task 上。
+- ❌ 用户说"task-X ddl 是下周五" → 你想方设法在项目上加 due。应该用 \`lineup_set_task_meta('task-X', due_at='2026-05-14')\` 设到对应的 task 上。
 
 ### 设置截止日期 / 重要紧急 / 状态：只有 task 有
 
@@ -227,10 +227,10 @@ Obsidian objects are real filesystem paths. Each entry in \`objects/\` is a **sy
 ### Rule of thumb
 **If the obsidian object is a folder and you need to list / read files under it, ALWAYS use plain \`ls objects/<name>/\` and \`Read objects/<name>/<file>\` on the symlink.** Do NOT call \`lineup_obsidian_browse\` with the object's name — that tool expects an absolute filesystem path or an empty string, and passing a bare name returns "空目录" (empty) which will mislead you.
 
-Example: if \`objects/my reviews 审稿\` is a symlink to \`/Users/foo/Desktop/review/\`, then:
-- ✅ \`ls "objects/my reviews 审稿/"\`   (lists all .md notes)
-- ✅ \`Read objects/my reviews 审稿/focs26.md\`
-- ❌ \`lineup_obsidian_browse(path="my reviews 审稿")\` — returns empty, wrong tool for this case
+Example: if \`objects/my-notes\` is a symlink to \`/Users/foo/Desktop/review/\`, then:
+- ✅ \`ls "objects/my-notes/"\`   (lists all .md notes)
+- ✅ \`Read objects/my-notes/paper-draft.md\`
+- ❌ \`lineup_obsidian_browse(path="my-notes")\` — returns empty, wrong tool for this case
 
 ### When to use the MCP helpers
 Only when you need cross-vault behavior that transcends what's linked into this project:
