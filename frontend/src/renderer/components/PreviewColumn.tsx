@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeKatex from 'rehype-katex'
 import TurndownService from 'turndown'
 import 'katex/dist/katex.min.css'
+import { MailPreview } from './MailPreview'
 
 const DEFAULT_PREVIEW_WIDTH = 512  // matches old w-[32rem]
 const MIN_PREVIEW_WIDTH = 280
@@ -96,6 +97,31 @@ export function PreviewColumn({ objectType, target, label }: PreviewColumnProps)
       title="拖动调整宽度"
     />
   )
+
+  // Mail objects use the dedicated MailPreview component — same code path
+  // as the inbox inline preview (cache-first, attachments, inline images).
+  if (objectType === 'mail' || target.startsWith('message:') || target.startsWith('mailrow:')) {
+    return (
+      <div style={{ width }} className="border-r border-border flex flex-col h-full shrink-0 overflow-hidden relative">
+        {resizeHandle}
+        <div className="px-3 py-2 border-b border-border bg-card/50 shrink-0">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded shrink-0">邮件</span>
+            <span className="font-medium text-sm truncate">{label}</span>
+            <a
+              href="#"
+              onClick={(e) => { e.preventDefault(); window.lineup.openTarget('mail', target) }}
+              className="text-xs text-primary hover:underline shrink-0"
+              title="在 Mail.app 中打开"
+            >📧</a>
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto px-3 py-3">
+          <MailPreview target={target} />
+        </div>
+      </div>
+    )
+  }
 
   // URL objects get a full embedded browser — no IPC preview needed.
   if (objectType === 'url' && target.startsWith('http')) {
@@ -208,6 +234,24 @@ export function PreviewColumn({ objectType, target, label }: PreviewColumnProps)
             <ReactMarkdown
               remarkPlugins={[remarkMath, remarkGfm]}
               rehypePlugins={[rehypeKatex]}
+              components={{
+                // Intercept ALL rendered links — without this, clicking a
+                // link inside an email / trilium preview would hijack the
+                // whole Electron window (no address bar, no back, no exit).
+                // Send the URL to the system browser via shell.openExternal.
+                a: ({ href, children, ...rest }) => (
+                  <a
+                    {...rest}
+                    href={href}
+                    onClick={(e) => {
+                      e.preventDefault()
+                      if (href) window.lineup.openTarget('url', href)
+                    }}
+                  >
+                    {children}
+                  </a>
+                ),
+              }}
             >
               {renderContent}
             </ReactMarkdown>

@@ -58,20 +58,6 @@ export function ProjectDetail({ projectId, onNavigate, onBack, onHome, onRefresh
     return () => { cancelled = true }
   }, [projectId])
 
-  useEffect(() => {
-    function handleKey(e: KeyboardEvent) {
-      if (e.key === 'ArrowLeft') {
-        e.preventDefault()
-        onBack()
-      } else if (e.key === 'Escape') {
-        e.preventDefault()
-        onHome()
-      }
-    }
-    window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
-  }, [onBack, onHome])
-
   if (!project) return <div className="p-8 text-muted-foreground">加载中...</div>
 
   return (

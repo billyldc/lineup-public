@@ -52,7 +52,7 @@ class Plugin:
         """Convert a real target path to a pretty display path.
 
         Returns None if this plugin doesn't recognize the target.
-        e.g. /Users/x/Documents/notes/note.md -> obsidian://vault/note.md
+        e.g. /Users/x/Desktop/科研/科研笔记/note.md -> obsidian://科研笔记/note.md
         """
         return None
 

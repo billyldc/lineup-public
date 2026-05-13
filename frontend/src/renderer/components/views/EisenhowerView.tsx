@@ -4,10 +4,12 @@ import { TaskRow, effectiveUrgent } from './TaskViewShared'
 
 interface EisenhowerViewProps {
   refreshSignal: number
+  onSelectTask: (task: TaskViewRow) => void
   onJumpToTask: (task: TaskViewRow) => void
+  selectedTaskId: number | null
 }
 
-export function EisenhowerView({ refreshSignal, onJumpToTask }: EisenhowerViewProps) {
+export function EisenhowerView({ refreshSignal, onSelectTask, onJumpToTask, selectedTaskId }: EisenhowerViewProps) {
   const [tasks, setTasks] = useState<TaskViewRow[]>([])
 
   const load = useCallback(async () => {
@@ -36,47 +38,29 @@ export function EisenhowerView({ refreshSignal, onJumpToTask }: EisenhowerViewPr
       </div>
 
       <div className="flex-1 overflow-hidden grid grid-cols-2 grid-rows-2 gap-px bg-border">
-        <Quadrant
-          title="🔥 紧急 + 重要"
-          tint="bg-red-500/5"
-          tasks={q1}
-          onToggleDone={toggleDone}
-          onJump={onJumpToTask}
-        />
-        <Quadrant
-          title="🌱 重要 · 不紧急"
-          tint="bg-green-500/5"
-          tasks={q2}
-          onToggleDone={toggleDone}
-          onJump={onJumpToTask}
-        />
-        <Quadrant
-          title="⚡ 紧急 · 不重要"
-          tint="bg-amber-500/5"
-          tasks={q3}
-          onToggleDone={toggleDone}
-          onJump={onJumpToTask}
-        />
-        <Quadrant
-          title="😴 都不"
-          tint="bg-slate-500/5"
-          tasks={q4}
-          onToggleDone={toggleDone}
-          onJump={onJumpToTask}
-        />
+        <Quadrant title="🔥 紧急 + 重要" tint="bg-red-500/5" tasks={q1}
+          onToggleDone={toggleDone} onSelect={onSelectTask} onJump={onJumpToTask} selectedTaskId={selectedTaskId} />
+        <Quadrant title="🌱 重要 · 不紧急" tint="bg-green-500/5" tasks={q2}
+          onToggleDone={toggleDone} onSelect={onSelectTask} onJump={onJumpToTask} selectedTaskId={selectedTaskId} />
+        <Quadrant title="⚡ 紧急 · 不重要" tint="bg-amber-500/5" tasks={q3}
+          onToggleDone={toggleDone} onSelect={onSelectTask} onJump={onJumpToTask} selectedTaskId={selectedTaskId} />
+        <Quadrant title="😴 都不" tint="bg-slate-500/5" tasks={q4}
+          onToggleDone={toggleDone} onSelect={onSelectTask} onJump={onJumpToTask} selectedTaskId={selectedTaskId} />
       </div>
     </div>
   )
 }
 
 function Quadrant({
-  title, tint, tasks, onToggleDone, onJump,
+  title, tint, tasks, onToggleDone, onSelect, onJump, selectedTaskId,
 }: {
   title: string
   tint: string
   tasks: TaskViewRow[]
   onToggleDone: (task: TaskViewRow) => void
+  onSelect: (task: TaskViewRow) => void
   onJump: (task: TaskViewRow) => void
+  selectedTaskId: number | null
 }) {
   return (
     <div className={`${tint} overflow-hidden flex flex-col`}>
@@ -88,7 +72,9 @@ function Quadrant({
           <div className="text-center text-xs text-muted-foreground py-4 italic">—</div>
         ) : (
           tasks.map(t => (
-            <TaskRow key={t.id} task={t} onToggleDone={onToggleDone} onJump={onJump} />
+            <TaskRow key={t.id} task={t} onToggleDone={onToggleDone}
+              onSelect={onSelect} onJump={onJump}
+              isSelected={selectedTaskId === t.id} />
           ))
         )}
       </div>

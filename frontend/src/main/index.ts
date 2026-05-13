@@ -1,12 +1,38 @@
 import { app, BrowserWindow, ipcMain, dialog, shell, clipboard } from 'electron'
 import { join, extname, dirname, basename, relative } from 'path'
-import { execFile } from 'child_process'
+import { execFile, spawn } from 'child_process'
 import { homedir } from 'os'
-import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, rmSync, watchFile, unwatchFile } from 'fs'
+import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, writeFileSync, rmSync, watchFile, unwatchFile, createReadStream, utimesSync } from 'fs'
+import { createInterface } from 'readline'
 import { createHash } from 'crypto'
 import { createRequire } from 'module'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { getDb } from './db'
+import {
+  startMemoryMonitor, captureSample as captureMemorySample,
+  getRecentSamples as getMemorySamples, getLogPath as getMemoryLogPath,
+} from './memory'
+
+// Silence node-pty's "Unhandled pty write error" EIO noise. It fires
+// when we kill a pty (hibernate / tab close) while xterm's onData
+// handler still has a write IPC in flight — our pty:write reaches main
+// before pty:kill has scrubbed the entry, queues the data, then the fd
+// closes and node-pty's async flush hits EIO. The data was destined for
+// a process we just killed, so dropping it is correct; the library just
+// can't tell its caller intended that. node-pty 1.x has no hook to
+// suppress this internally, so we wrap console.error.
+const _origConsoleError = console.error
+console.error = function (...args: unknown[]) {
+  if (
+    args.length >= 2
+    && args[0] === 'Unhandled pty write error'
+    && typeof args[1] === 'object' && args[1] !== null
+    && (args[1] as { code?: string }).code === 'EIO'
+  ) {
+    return  // benign hibernate/kill race — drop
+  }
+  _origConsoleError.apply(console, args as [unknown, ...unknown[]])
+}
 
 // Use ESM imports so Rollup doesn't create renamed local variables inside
 // each function, which was causing "Cannot access 'existsSync2' before
@@ -14,9 +40,15 @@ import { getDb } from './db'
 const nativeRequire = createRequire(import.meta.url || __filename)
 
 // Path to the lineup Python CLI. Uses uv to run in the project's venv.
-const LINEUP_ROOT = join(homedir(), 'lineup')  // TODO: make configurable
+// Override with the LINEUP_ROOT env var (e.g. when running the Electron
+// shell against a checkout in a non-default location).
+const LINEUP_ROOT = process.env.LINEUP_ROOT || join(homedir(), 'lineup')
 
-import { LINEUP_HOME, VIRTUAL_PROJECTS_ROOT, WAL_PATH, SHARED_MCP_PATH } from './paths'
+// Root of the virtual project folders that the per-project "main agent"
+// claude sessions run inside. See syncProjectVirtualFolder().
+// Override with LINEUP_DATA_DIR to relocate everything (~/.lineup) elsewhere.
+const LINEUP_DATA_DIR = process.env.LINEUP_DATA_DIR || join(homedir(), '.lineup')
+const VIRTUAL_PROJECTS_ROOT = join(LINEUP_DATA_DIR, 'projects')
 
 /**
  * Turn a project name into a filesystem-safe slug for the virtual folder.
@@ -30,8 +62,272 @@ function projectSlug(name: string): string {
     .trim() || 'project'
 }
 
-function virtualProjectDir(projectName: string): string {
-  return join(VIRTUAL_PROJECTS_ROOT, projectSlug(projectName))
+/**
+ * Compute the on-disk virtual dir for a project by walking the
+ * project_parents tree. Mirrors lineup's logical project hierarchy on
+ * disk so e.g. 感兴趣的论文 (parent=学习) lives at
+ * `~/.lineup/projects/学习/感兴趣的论文/` instead of being flattened to
+ * `~/.lineup/projects/感兴趣的论文/`. Same-named children of different
+ * parents naturally don't collide.
+ *
+ * Multi-parent projects pick the smallest parent_id (deterministic;
+ * matches the "first folder wins" pattern used elsewhere). Cycles are
+ * defended via a depth cap + visited set.
+ */
+function virtualProjectDirById(projectId: number, projectName: string): string {
+  const db = getDb()
+  const seen = new Set<number>()
+  const chain: string[] = [projectSlug(projectName)]
+  let curId: number = projectId
+  let depth = 0
+  while (depth++ < 16) {
+    if (seen.has(curId)) break
+    seen.add(curId)
+    const parent = db.prepare(
+      'SELECT pp.parent_id, p.name FROM project_parents pp ' +
+      'JOIN projects p ON p.id = pp.parent_id ' +
+      'WHERE pp.project_id = ? ORDER BY pp.parent_id LIMIT 1'
+    ).get(curId) as { parent_id: number; name: string } | undefined
+    if (!parent) break
+    chain.unshift(projectSlug(parent.name))
+    curId = parent.parent_id
+  }
+  return join(VIRTUAL_PROJECTS_ROOT, ...chain)
+}
+
+/**
+ * One-shot migration: clean up flat virtual dirs left behind by the
+ * pre-Plan-C layout where every project lived directly under
+ * VIRTUAL_PROJECTS_ROOT regardless of its parent.
+ *
+ * For each top-level entry that:
+ *   1. has a name matching a project AND
+ *   2. that project HAS a parent (so its real virtual path should be
+ *      nested, not flat) AND
+ *   3. the nested path differs from the flat path
+ *
+ * we move CLAUDE.md.manual (the only user-owned file) into the nested
+ * dir if missing there, then nuke the flat dir. CLAUDE.md and objects/
+ * are auto-regenerated by syncProjectVirtualFolder so we don't bother
+ * preserving them.
+ *
+ * Why this matters: agent tabs spawned before the migration cached the
+ * old flat cwd in localStorage and continued spawning claude there even
+ * after the project moved. Removing the flat dir forces those tabs to
+ * fail predictably (and the renderer's stale-tab check then drops +
+ * respawns them at the correct nested cwd).
+ */
+function migrateFlatVirtualDirs(): void {
+  const db = getDb()
+
+  // Pass 1: scan every project with parents (so nested ≠ flat) and
+  // check whether its OLD encoded session-storage dir still holds
+  // orphan jsonls in ~/.claude/projects/. This pass runs even when the
+  // flat virtual dir at VIRTUAL_PROJECTS_ROOT is already gone — earlier
+  // migration versions deleted the flat dir without moving the jsonls,
+  // leaving sessions reachable from AgentsView's grouping but failing
+  // every `claude --resume` from the new cwd because the jsonl lives
+  // in a dir whose encoding maps from the old flat path, not the new
+  // nested path.
+  const projectsWithParents = db.prepare(
+    'SELECT DISTINCT p.id, p.name FROM projects p ' +
+    'JOIN project_parents pp ON pp.project_id = p.id'
+  ).all() as Array<{ id: number; name: string }>
+  for (const proj of projectsWithParents) {
+    const slug = projectSlug(proj.name)
+    const flatPath = join(VIRTUAL_PROJECTS_ROOT, slug)
+    const nestedPath = virtualProjectDirById(proj.id, proj.name)
+    if (flatPath === nestedPath) continue
+    try {
+      migrateSessionJsonlsForCwd(flatPath, nestedPath)
+    } catch (e) {
+      console.warn(`[migrate] orphan-jsonl migration failed for ${proj.name}:`, e)
+    }
+  }
+
+  // Pass 2: clean up any flat virtual dir that's STILL on disk
+  // (CLAUDE.md.manual preservation + delete the dir + move jsonls
+  // belt-and-suspenders if pass 1 missed them somehow).
+  if (!existsSync(VIRTUAL_PROJECTS_ROOT)) return
+  let entries: string[]
+  try {
+    entries = readdirSync(VIRTUAL_PROJECTS_ROOT)
+  } catch { return }
+  for (const entry of entries) {
+    const flatPath = join(VIRTUAL_PROJECTS_ROOT, entry)
+    let isDir = false
+    try { isDir = statSync(flatPath).isDirectory() } catch { continue }
+    if (!isDir) continue
+
+    // Look up project by exact name. projectSlug strips weird chars but
+    // for the purpose of this check we want the slug to round-trip; if
+    // a flat dir name doesn't match any project's slug, leave it alone.
+    const proj = db.prepare(
+      'SELECT id, name FROM projects WHERE name = ?'
+    ).get(entry) as { id: number; name: string } | undefined
+    if (!proj) continue
+    if (projectSlug(proj.name) !== entry) continue  // safety: name mismatch
+
+    const nestedPath = virtualProjectDirById(proj.id, proj.name)
+    if (nestedPath === flatPath) continue  // already nested-equal (root project)
+
+    // Preserve user-owned CLAUDE.md.manual if it exists at flat path
+    // and isn't already at the nested path.
+    const flatManual = join(flatPath, 'CLAUDE.md.manual')
+    const nestedManual = join(nestedPath, 'CLAUDE.md.manual')
+    if (existsSync(flatManual) && !existsSync(nestedManual)) {
+      try {
+        mkdirSync(nestedPath, { recursive: true })
+        const content = readFileSync(flatManual, 'utf8')
+        writeFileSync(nestedManual, content, 'utf8')
+        console.log(`[migrate] preserved CLAUDE.md.manual: ${flatManual} → ${nestedManual}`)
+      } catch (e) {
+        console.warn(`[migrate] failed to preserve manual for ${proj.name}:`, e)
+        continue  // don't delete the flat dir if preserve failed
+      }
+    }
+
+    // Migrate all session jsonls from the old encoded dir to the new
+    // one. Without this, claude --resume from the new cwd fails with
+    // "No conversation found" because the jsonls still live in
+    // ~/.claude/projects/<encoded-old-flat-path>/. Same encoding
+    // collision rules as everywhere else: a Chinese-only dir name may
+    // share the encoded slot with another project, so we verify each
+    // jsonl's first-line cwd before moving — only move those whose
+    // recorded cwd actually equals the old flat path.
+    try {
+      migrateSessionJsonlsForCwd(flatPath, nestedPath)
+    } catch (e) {
+      console.warn(`[migrate] session jsonl migration failed for ${proj.name}:`, e)
+    }
+
+    try {
+      rmSync(flatPath, { recursive: true, force: true })
+      console.log(`[migrate] removed stale flat virtual dir: ${flatPath}`)
+    } catch (e) {
+      console.warn(`[migrate] failed to remove ${flatPath}:`, e)
+    }
+  }
+}
+
+/**
+ * Move every claude session jsonl whose recorded cwd matches
+ * `oldCwd` from the old encoded dir to the new encoded dir, rewriting
+ * the cwd field in every line so the migrated session passes
+ * sessionMatchesCwd checks downstream.
+ *
+ * We only move (delete original after successful write) so AgentsView
+ * doesn't show the same session twice — once under the old folder
+ * path, once under the new. The old encoded directory itself gets
+ * removed if it becomes empty.
+ *
+ * Safe to run when oldCwd's encoded slot collides with other projects'
+ * encoded slot (multi-Chinese-char paths): jsonls whose first-line
+ * cwd doesn't match `oldCwd` are left untouched.
+ */
+function migrateSessionJsonlsForCwd(oldCwd: string, newCwd: string): void {
+  const oldEncoded = encodeCwdForClaude(oldCwd)
+  const newEncoded = encodeCwdForClaude(newCwd)
+  if (oldEncoded === newEncoded) return  // same dir on disk, nothing to move
+  const oldDir = join(homedir(), '.claude', 'projects', oldEncoded)
+  const newDir = join(homedir(), '.claude', 'projects', newEncoded)
+  if (!existsSync(oldDir)) return
+
+  let files: string[]
+  try {
+    files = readdirSync(oldDir).filter(f => f.endsWith('.jsonl'))
+  } catch { return }
+
+  let moved = 0
+  let kept = 0  // jsonls left in place (cwd mismatch — belongs elsewhere)
+  for (const f of files) {
+    const full = join(oldDir, f)
+    // Read once, rewrite cwd, write to new, then rm old. Direct IO so
+    // we don't depend on findSessionJsonl's readdir ordering — earlier
+    // versions delegated to copySessionJsonlForCwd which scans every
+    // encoded dir to locate the source, and on re-runs would resolve
+    // to the NEW copy and skip the rm path entirely, orphaning the
+    // original.
+    let content: string
+    let origMtime: Date
+    let origAtime: Date
+    try {
+      content = readFileSync(full, 'utf8')
+      const st = statSync(full)
+      origMtime = st.mtime
+      origAtime = st.atime
+    } catch { continue }
+
+    // Verify first-line cwd matches oldCwd before touching this file —
+    // encoded-slot collisions mean a sibling project's jsonl might
+    // share this dir.
+    let recordedCwd: string | null = null
+    for (const line of content.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const o = JSON.parse(line)
+        if (typeof o.cwd === 'string' && o.cwd) { recordedCwd = o.cwd; break }
+      } catch { /* keep scanning */ }
+    }
+    if (recordedCwd !== oldCwd) { kept++; continue }
+
+    // Rewrite cwd field in every line so AgentsView / sessionMatchesCwd
+    // see the session as belonging to the new (nested) path.
+    const rewritten: string[] = []
+    for (const line of content.split('\n')) {
+      if (!line.trim()) { rewritten.push(line); continue }
+      try {
+        const o = JSON.parse(line)
+        if (typeof o.cwd === 'string') o.cwd = newCwd
+        rewritten.push(JSON.stringify(o))
+      } catch {
+        rewritten.push(line)
+      }
+    }
+    const dst = join(newDir, f)
+    try {
+      mkdirSync(newDir, { recursive: true })
+      writeFileSync(dst, rewritten.join('\n'), 'utf8')
+      // Restore original mtime so ensureMainAgent's "newest by mtime"
+      // fallback keeps picking the historically-most-recent session
+      // instead of treating all migrated sessions as freshly-touched.
+      utimesSync(dst, origAtime, origMtime)
+    } catch (e) {
+      console.warn(`[migrate] write failed for ${dst}:`, e)
+      continue
+    }
+    // Sanity-check the write before removing the source — never want
+    // both deleted at once if a disk error happened mid-write.
+    let writeOk = false
+    try {
+      writeOk = statSync(dst).size > 0
+    } catch { /* ignore */ }
+    if (!writeOk) {
+      console.warn(`[migrate] post-write check failed for ${dst}; keeping source`)
+      continue
+    }
+    try {
+      rmSync(full, { force: true })
+      moved++
+    } catch (e) {
+      console.warn(`[migrate] rm failed for ${full}:`, e)
+    }
+  }
+
+  if (moved > 0) {
+    console.log(
+      `[migrate] moved ${moved} session jsonl(s): ${oldEncoded} → ${newEncoded}` +
+      (kept > 0 ? ` (kept ${kept} — different cwd, encoded-slot collision)` : ''),
+    )
+  }
+  // Remove the old encoded dir if it's now empty AND nothing else
+  // collided with it. Non-empty (collision) → leave alone.
+  try {
+    const remaining = readdirSync(oldDir)
+    if (remaining.length === 0) {
+      rmSync(oldDir, { recursive: true, force: true })
+    }
+  } catch { /* ignore */ }
 }
 
 /**
@@ -103,6 +399,34 @@ function buildInventoryAndSkills(
   )
   blocks.push('')
 
+  // Tell the agent where to WRITE new files. Default of writing in the
+  // current cwd (~/.lineup/projects/<slug>/) is almost never right — that
+  // directory is a synthesized view, not a real project folder that the
+  // user edits, backs up, or commits to git. Direct the agent toward the
+  // real folder objects instead.
+  const folderRows = rows.filter(r => r.type === 'folder')
+  blocks.push(`## 写文件的目标位置（**重要**）`)
+  if (folderRows.length === 0) {
+    blocks.push(
+      `这个项目目前没有链接任何 **folder 类型**的对象。写新文件之前，**先问用户**该放哪里——` +
+      `绝对**不要**直接写到当前 cwd（\`~/.lineup/projects/...\`）里，那是 lineup 生成的虚拟视图目录，` +
+      `用户不会在那里找文件。`
+    )
+  } else {
+    blocks.push(
+      `这个项目关联了 ${folderRows.length} 个真实文件夹对象，它们是用户实际工作的地方。**写新文件时默认应该放到其中一个**——` +
+      `通过 \`objects/<name>\` 这个 symlink 访问即可（例如 \`Write objects/<name>/foo.md\`），lineup 会把它写到 symlink 指向的真实路径。\n\n` +
+      `候选真实文件夹：\n` +
+      folderRows.map(r => `- \`objects/${r.name}\` → \`${r.target}\``).join('\n') +
+      (folderRows.length === 1
+        ? `\n\n这是项目里唯一的文件夹，没特别理由就写这里。`
+        : `\n\n有多个时，按文件类型/主题选最匹配的；判断不清就**先问用户**。`) +
+      `\n\n**不要**把新文件写到 cwd (\`~/.lineup/projects/...\`) 或它的子目录。` +
+      `那是 lineup 合成的只读式视图，用户不会去那里找东西，写进去的内容也可能被下次 ensureMainAgent 同步时覆盖。`
+    )
+  }
+  blocks.push('')
+
   // Stable ordering when emitting skill sections
   const ordered = ['zotero', 'trilium', 'obsidian', 'folder', 'file', 'url', 'script']
 
@@ -131,8 +455,8 @@ function buildInventoryAndSkills(
 
 lineup 里只有三种层级：
 
-- **project**：长期工作区（例如 \`research\`, \`work\`, \`personal\`）。可以嵌套 project 和 task。有 main agent 和 objects/。
-- **task**：一次具体工作（例如 "review paper X", "apply to company Y"）。*parallel* — 和兄弟 task 互不阻塞。每个 task 可以有自己的 agent 和 objects/。
+- **project**：长期工作区（例如 \`review\`, \`research\`, \`实习\`）。可以嵌套 project 和 task。有 main agent 和 objects/。
+- **task**：一次具体工作（例如"审稿 FOCS26 paper 42"）。*parallel* — 和兄弟 task 互不阻塞。每个 task 可以有自己的 agent 和 objects/。
 - **step**：task 内部的顺序 checklist。*sequential* — 前一个没做完后一个就被 lock。只有 agent 能创建。
 
 ### 创建任何 project / task / step 之前，按顺序做这三件事：
@@ -153,12 +477,30 @@ lineup 里只有三种层级：
 **MCP 里没有 \`lineup_todo_add\`** —— todo 功能已被 task + step 取代。
 所有步骤化的需求只用 step；所有独立提醒只用 task 的 \`due_at\`。
 
+### 建 task 必须配 step；不要把步骤塞进 description（**重要**）
+
+**当用户交代一件具体的、可分解的工作时，默认动作是 \`lineup_create_task\` + 多个 \`lineup_create_step\`，而不是只建一个 task 把执行步骤写进 description。**
+
+- 判断标准：心里默念"第一步...第二步..."能列出来 → 一定写成 step。哪怕只有 2-3 步也写。
+- description 是 task / project 的**长期定位**：来源、动机、关键链接、依赖、约束。**不写执行步骤**。一句话能讲清就别写一段。
+- ❌ 反例：邮件通知 "Your Accepted Manuscript is now in ACM DL"，需要 (1) 在 ACM 上确认是哪篇论文 (2) 在 personal_homepage 更新 publications (3) 同步 CV publications。**不要**只建一个 task 把这三步堆到 description 里就完事。要建一个 task + 三个 step。
+- description 字段越短越好；只在它能帮助未来读者迅速理解 task 是什么时才写。已有 task / project 的 description **不要主动改**——除非用户明确要求修改。
+
+### 建 task 默认带 ddl = 今天
+
+\`lineup_create_task\` 之后**默认**调一次 \`lineup_set_task_meta(name, due_at='<今天日期 YYYY-MM-DD>')\` 把截止日设成今天。例外：
+
+- 用户明确给了具体日期 → 用那个日期
+- 用户明确说"没 ddl / 不急 / 长期 task" → 跳过
+
+不要因为"看起来不急"就不设 ddl —— Today 视图完全依赖 \`due_at\`，没设的 task 直接从用户视野里消失。**今天的日期看 system prompt 顶部的 \`currentDate\`。**
+
 ### 常见错误（不要犯）
 
-- ❌ 用户说"放到 project-X 这个新建的子项目下面" → 你直接建 project。应该先 \`list_children\` 看是不是已经有一个 同名或相似的 task，如果有就问用户是不是指它。
+- ❌ 用户说"放到 FOCS2026review 这个新建的子项目下面" → 你直接建 project。应该先 \`list_children\` 看是不是已经有一个 FOCS 相关的 task，如果有就问用户是不是指它。
 - ❌ 用户说"把 step-wise 的流程也新建进去" → 你用 \`lineup_todo_add\`。应该用 \`lineup_create_task\` + 多次 \`lineup_create_step\`。
 - ❌ 用户说"子项目" → 你二话不说建 project。应该问："你是要 project 还是 task？"（多数情况下用户指的是 task）。
-- ❌ 用户说"task-X ddl 是下周五" → 你想方设法在项目上加 due。应该用 \`lineup_set_task_meta('task-X', due_at='2026-05-14')\` 设到对应的 task 上。
+- ❌ 用户说"FOCS26 ddl 是 5 月 14 日" → 你想方设法在项目上加 due。应该用 \`lineup_set_task_meta('FOCS26review', due_at='2026-05-14')\` 设到对应的 task 上。
 
 ### 设置截止日期 / 重要紧急 / 状态：只有 task 有
 
@@ -225,10 +567,10 @@ Obsidian objects are real filesystem paths. Each entry in \`objects/\` is a **sy
 ### Rule of thumb
 **If the obsidian object is a folder and you need to list / read files under it, ALWAYS use plain \`ls objects/<name>/\` and \`Read objects/<name>/<file>\` on the symlink.** Do NOT call \`lineup_obsidian_browse\` with the object's name — that tool expects an absolute filesystem path or an empty string, and passing a bare name returns "空目录" (empty) which will mislead you.
 
-Example: if \`objects/my-notes\` is a symlink to \`/Users/foo/Desktop/review/\`, then:
-- ✅ \`ls "objects/my-notes/"\`   (lists all .md notes)
-- ✅ \`Read objects/my-notes/paper-draft.md\`
-- ❌ \`lineup_obsidian_browse(path="my-notes")\` — returns empty, wrong tool for this case
+Example: if \`objects/my reviews 审稿\` is a symlink to \`/Users/foo/Desktop/review/\`, then:
+- ✅ \`ls "objects/my reviews 审稿/"\`   (lists all .md notes)
+- ✅ \`Read objects/my reviews 审稿/focs26.md\`
+- ❌ \`lineup_obsidian_browse(path="my reviews 审稿")\` — returns empty, wrong tool for this case
 
 ### When to use the MCP helpers
 Only when you need cross-vault behavior that transcends what's linked into this project:
@@ -267,9 +609,39 @@ Script objects are symlinks to executables. You may \`Read\` them to review, but
  * Called every time the project is focused in the UI so the virtual folder
  * stays in sync with the DB.
  */
+/**
+ * Repair `message://` URLs that came out of older versions of the mail
+ * adapter. Two known damage modes, both fatal to Apple Mail (it returns
+ * MCMailErrorDomain 1030):
+ *
+ *   1. Whitespace inside the message-id portion. RFC 5322 header folding
+ *      put a CRLF + WSP in the middle of long Message-IDs, and an old
+ *      version of `_parse_rfc_message_id` didn't unfold cleanly. Result:
+ *      `message:// 69f04..._168433...%40prod-...`. Mail rejects on the
+ *      embedded space.
+ *
+ *   2. Backslash-escaped percent signs (`\%40`). Some path through the
+ *      old adapter / persistence escaped the `%` for display and we
+ *      stored that. Mail expects raw `%40`.
+ *
+ * Newly extracted URLs no longer have these issues (mail.py:130 strips
+ * whitespace post-unfolding), but existing inbox rows still do — sanitize
+ * at open-time instead of running a migration.
+ */
+function sanitizeMessageUrl(url: string): string {
+  if (!url.startsWith('message://')) return url
+  let id = url.slice('message://'.length)
+  id = id.replace(/\s+/g, '')
+  id = id.replace(/\\(?=%)/g, '')
+  return 'message://' + id
+}
+
+
 function syncProjectVirtualFolder(project: { id: number; name: string; description: string | null }): string {
   const db = getDb()
-  const dir = virtualProjectDir(project.name)
+  // Nest under the parent project's slug — mirrors the project tree on
+  // disk so child agents are siblings of their parent's virtual folder.
+  const dir = virtualProjectDirById(project.id, project.name)
   mkdirSync(dir, { recursive: true })
   const objectsDir = join(dir, 'objects')
   mkdirSync(objectsDir, { recursive: true })
@@ -344,7 +716,7 @@ function syncProjectVirtualFolder(project: { id: number; name: string; descripti
 
   // ── .mcp.json ────────────────────────────────────────────────
   // Inherit from ~/.lineup/.mcp.json if present, otherwise leave alone.
-  const sharedMcp = SHARED_MCP_PATH
+  const sharedMcp = join(LINEUP_DATA_DIR, '.mcp.json')
   if (existsSync(sharedMcp)) {
     try {
       writeFileSync(join(dir, '.mcp.json'), readFileSync(sharedMcp, 'utf8'), 'utf8')
@@ -355,17 +727,50 @@ function syncProjectVirtualFolder(project: { id: number; name: string; descripti
 }
 
 function createWindow(): BrowserWindow {
+  // Fullscreen on launch when the env flag is set. Toggled via
+  // `npm run dev:fullscreen` or any `LINEUP_FULLSCREEN=1` invocation;
+  // preserves the manual ⌃⌘F shortcut as the cross-mode default.
+  const startFullscreen =
+    process.env.LINEUP_FULLSCREEN === '1' ||
+    process.env.LINEUP_FULLSCREEN === 'true'
+
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
     minWidth: 800,
     minHeight: 500,
     titleBarStyle: 'hiddenInset',
+    fullscreen: startFullscreen,
     webPreferences: {
       preload: join(__dirname, '../preload/index.mjs'),
       sandbox: false,
       webviewTag: true,  // enables <webview> for URL preview
     }
+  })
+
+  // Block accidental navigation of the main window — e.g. clicking a
+  // link in a rendered email preview would otherwise replace the whole
+  // lineup UI with that URL (no way back, no address bar). External
+  // URLs go to the user's default browser instead.
+  win.webContents.on('will-navigate', (event, targetUrl) => {
+    const current = win.webContents.getURL()
+    // Allow navigations within our renderer (dev HMR, reloads, file:// loads).
+    try {
+      const cur = new URL(current)
+      const tgt = new URL(targetUrl)
+      if (cur.origin === tgt.origin && cur.protocol === tgt.protocol) return
+    } catch { /* fall through to block */ }
+    event.preventDefault()
+    if (/^https?:/i.test(targetUrl)) {
+      shell.openExternal(targetUrl).catch(() => { /* ignore */ })
+    }
+  })
+  // window.open / <a target="_blank"> also go to default browser.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) {
+      shell.openExternal(url).catch(() => { /* ignore */ })
+    }
+    return { action: 'deny' }
   })
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
@@ -488,7 +893,7 @@ async function previewZoteroItemAsync(target: string): Promise<PreviewResult> {
   return new Promise((resolve) => {
     const py = `
 import sys
-sys.path.insert(0, '${LINEUP_ROOT}')
+sys.path.insert(0, ${JSON.stringify(LINEUP_ROOT)})
 from lineup.plugins.zotero import ZoteroPlugin
 print(ZoteroPlugin().read(sys.argv[1]))
 `
@@ -499,6 +904,259 @@ print(ZoteroPlugin().read(sys.argv[1]))
           return
         }
         resolve({ kind: 'markdown', content: stdout.trim() })
+      })
+  })
+}
+
+/**
+ * Wrap raw preview payload (html/text/headers) into a PreviewResult for
+ * PreviewColumn. Shared between cache-hit and cache-miss paths so both
+ * produce identical output.
+ */
+function buildMailPreviewResult(data: {
+  subject?: string; from?: string; to?: string; cc?: string; date?: string
+  html?: string; text?: string
+}): PreviewResult {
+  const header = [
+    data.subject ? `**主题**: ${data.subject}` : '',
+    data.from    ? `**发件人**: ${data.from}`    : '',
+    data.to      ? `**收件人**: ${data.to}`      : '',
+    data.cc      ? `**抄送**: ${data.cc}`        : '',
+    data.date    ? `**日期**: ${data.date}`      : '',
+  ].filter(Boolean).join('\n\n')
+  if (data.html) {
+    const headerHtml = header
+      .split('\n\n')
+      .map(l => `<p>${l.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')}</p>`)
+      .join('')
+    return { kind: 'html', content: `<div>${headerHtml}<hr/>${data.html}</div>` }
+  }
+  if (data.text) {
+    return { kind: 'markdown', content: header + '\n\n---\n\n' + data.text }
+  }
+  return { kind: 'empty', content: header || '(邮件正文为空)' }
+}
+
+/**
+ * Shell out to `lu mail preview <target>`. Caches the parsed body in
+ * mail_preview_cache keyed by target; subsequent loads are instant
+ * SQLite reads. The cache entry stores the emlx path + mtime so when
+ * the underlying .emlx changes (rare — emails are immutable but Mail.app
+ * occasionally rewrites for moves/flags) we invalidate and re-parse.
+ */
+/**
+ * Structured mail preview (cache-first). Used by the inline `<MailPreview>`
+ * component in the inbox as well as project-view preview. Same target →
+ * same SQLite cache row as previewMailAsync, but returns the raw fields
+ * instead of a rendered PreviewResult so the renderer can show
+ * attachments + headers in its own layout.
+ */
+interface MailFullPreview {
+  ok: boolean
+  subject?: string
+  from?: string
+  to?: string
+  cc?: string
+  date?: string
+  html?: string
+  text?: string
+  attachments?: Array<{
+    index: number
+    name: string
+    size: number
+    content_type: string
+    is_inline_image?: boolean
+    available?: boolean
+  }>
+  emlx_path?: string
+  error?: string
+}
+
+async function loadMailFullPreview(
+  target: string, inboxItemId?: number,
+): Promise<MailFullPreview> {
+  const db = getDb()
+  const cached = db.prepare(
+    'SELECT emlx_path, emlx_mtime_ms, subject, from_addr, to_addr, cc_addr, date_str, html, text, attachments_json ' +
+    'FROM mail_preview_cache WHERE target = ?'
+  ).get(target) as any
+  if (cached) {
+    let fresh = false
+    if (cached.emlx_path) {
+      try {
+        const s = statSync(cached.emlx_path)
+        if (s.mtimeMs === cached.emlx_mtime_ms) fresh = true
+      } catch { fresh = false }
+    } else {
+      fresh = true
+    }
+    if (fresh) {
+      let attachments: any[] = []
+      try { attachments = JSON.parse(cached.attachments_json || '[]') }
+      catch { /* legacy row without attachments column */ }
+      return {
+        ok: true,
+        subject: cached.subject ?? '',
+        from: cached.from_addr ?? '',
+        to: cached.to_addr ?? '',
+        cc: cached.cc_addr ?? '',
+        date: cached.date_str ?? '',
+        html: cached.html ?? '',
+        text: cached.text ?? '',
+        attachments,
+        emlx_path: cached.emlx_path,
+      }
+    }
+  }
+
+  // Cache miss. Pass --inbox-item to lu mail preview so it does the
+  // metadata-aware lookup directly (point query in Envelope Index) when
+  // the cached ROWID/Message-ID has gone stale. Avoids both the
+  // resolve+preview round-trip AND the slow rglob fallback that hammers
+  // the disk under prewarm load.
+  return new Promise((resolve) => {
+    const args = [
+      'run', '--directory', LINEUP_ROOT, 'lu', 'mail', 'preview', target,
+    ]
+    if (inboxItemId) {
+      args.push('--inbox-item', String(inboxItemId))
+    }
+    execFile('uv', args, { cwd: LINEUP_ROOT, timeout: 30000, maxBuffer: 20 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          resolve({ ok: false, error: `邮件预览失败: ${err.message}` })
+          return
+        }
+        let data: any
+        try { data = JSON.parse(stdout.trim()) }
+        catch (e: any) {
+          resolve({ ok: false, error: `解析邮件预览输出失败: ${e.message}` })
+          return
+        }
+        if (data.error) {
+          resolve({ ok: false, error: data.error })
+          return
+        }
+        // Persist with attachments_json. Cache key is the original target
+        // (so e.g. mailrow:42202 hits the same cache row even though we
+        // resolved through to message://...) — keeps re-clicks fast.
+        try {
+          db.prepare(`
+            INSERT OR REPLACE INTO mail_preview_cache
+              (target, emlx_path, emlx_mtime_ms,
+               subject, from_addr, to_addr, cc_addr, date_str,
+               html, text, attachments_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          `).run(
+            target,
+            data.emlx_path ?? null,
+            data.emlx_mtime_ms ?? null,
+            data.subject ?? '',
+            data.from ?? '',
+            data.to ?? '',
+            data.cc ?? '',
+            data.date ?? '',
+            data.html ?? '',
+            data.text ?? '',
+            JSON.stringify(data.attachments || []),
+          )
+        } catch (e) { console.error('[mail] cache write failed:', e) }
+
+        resolve({
+          ok: true,
+          subject: data.subject ?? '',
+          from: data.from ?? '',
+          to: data.to ?? '',
+          cc: data.cc ?? '',
+          date: data.date ?? '',
+          html: data.html ?? '',
+          text: data.text ?? '',
+          attachments: data.attachments || [],
+          emlx_path: data.emlx_path,
+        })
+      })
+  })
+}
+
+async function previewMailAsync(target: string): Promise<PreviewResult> {
+  const db = getDb()
+  const cached = db.prepare(
+    'SELECT emlx_path, emlx_mtime_ms, subject, from_addr, to_addr, cc_addr, date_str, html, text ' +
+    'FROM mail_preview_cache WHERE target = ?'
+  ).get(target) as any
+  if (cached) {
+    // Freshness check: if the emlx file exists and mtime matches, serve
+    // from cache. Otherwise fall through to re-parse.
+    let fresh = false
+    if (cached.emlx_path) {
+      try {
+        const s = statSync(cached.emlx_path)
+        if (s.mtimeMs === cached.emlx_mtime_ms) fresh = true
+      } catch { fresh = false }
+    } else {
+      // Cached row without path — trust it (message:// target that we
+      // scanned for previously; retention is fine).
+      fresh = true
+    }
+    if (fresh) {
+      return buildMailPreviewResult({
+        subject: cached.subject ?? '',
+        from: cached.from_addr ?? '',
+        to: cached.to_addr ?? '',
+        cc: cached.cc_addr ?? '',
+        date: cached.date_str ?? '',
+        html: cached.html ?? '',
+        text: cached.text ?? '',
+      })
+    }
+  }
+
+  return new Promise((resolve) => {
+    const args = ['run', '--directory', LINEUP_ROOT, 'lu', 'mail', 'preview', target]
+    execFile('uv', args, { cwd: LINEUP_ROOT, timeout: 30000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) {
+          resolve({ kind: 'error', content: '', error: `邮件预览失败: ${err.message}` })
+          return
+        }
+        let data: any
+        try { data = JSON.parse(stdout.trim()) }
+        catch (e: any) {
+          resolve({ kind: 'error', content: '', error: `解析邮件预览输出失败: ${e.message}` })
+          return
+        }
+        if (data.error) {
+          resolve({ kind: 'error', content: '', error: data.error })
+          return
+        }
+        // Persist: store parsed body + mtime of the emlx (if we know it).
+        // emlx_path is optional — Python side could pass it back, but we
+        // can also live without it and just cache indefinitely (emails are
+        // immutable in practice).
+        try {
+          db.prepare(`
+            INSERT OR REPLACE INTO mail_preview_cache
+              (target, emlx_path, emlx_mtime_ms,
+               subject, from_addr, to_addr, cc_addr, date_str, html, text, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+          `).run(
+            target,
+            data.emlx_path ?? null,
+            data.emlx_mtime_ms ?? null,
+            data.subject ?? '',
+            data.from ?? '',
+            data.to ?? '',
+            data.cc ?? '',
+            data.date ?? '',
+            data.html ?? '',
+            data.text ?? '',
+          )
+        } catch (e) { console.error('[mail] cache write failed:', e) }
+
+        resolve(buildMailPreviewResult({
+          subject: data.subject, from: data.from, to: data.to,
+          cc: data.cc, date: data.date, html: data.html, text: data.text,
+        }))
       })
   })
 }
@@ -681,6 +1339,135 @@ interface DiscoveredSession {
  * jsonl lives under ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl and we
  * read it for metadata (message count, summary).
  */
+/**
+ * Read a session jsonl's recorded `cwd` and check whether it matches
+ * `expectedCwd`. Returns true when the session was actually started in
+ * that cwd, false otherwise (or when the jsonl can't be located/read).
+ *
+ * Why this exists: claude-code's per-cwd jsonl directory uses
+ * `cwd.replace(/[^a-zA-Z0-9]/g, '-')` as the dir name. Two cwds whose
+ * non-alphanumeric chars all collapse to `-` map to the same dir — most
+ * commonly any pair of two-char Chinese folder names like 学习 / 事工
+ * (both encode to `--`). Pick-by-mtime in such a directory will
+ * silently cross-wire sessions across projects. Always verify.
+ *
+ * Cached per-call inside this process to avoid re-reading the same
+ * jsonl across multiple ensureMainAgent invocations of the same project.
+ */
+const _sessionCwdsCache = new Map<string, string[]>()
+
+function readAllSessionCwds(sessionId: string): string[] {
+  if (_sessionCwdsCache.has(sessionId)) return _sessionCwdsCache.get(sessionId)!
+  const root = join(homedir(), '.claude', 'projects')
+  if (!existsSync(root)) {
+    _sessionCwdsCache.set(sessionId, [])
+    return []
+  }
+  // Scan EVERY encoded dir — claude-code may have the same session_id
+  // in multiple dirs after /branch, --resume from a different cwd, or
+  // auto-compact. Earlier we broke on the first hit, which lost the
+  // matching cwd when readdir surfaced the wrong copy first (sorted
+  // alphabetically: `--lineup-projects---` precedes `Desktop---`, so
+  // `/实习` projects lost to `/.lineup/projects/实习` shadows).
+  const cwds: string[] = []
+  try {
+    for (const dir of readdirSync(root)) {
+      const candidate = join(root, dir, `${sessionId}.jsonl`)
+      if (!existsSync(candidate)) continue
+      try {
+        const head = readFileSync(candidate, { encoding: 'utf8' }).slice(0, 32768)
+        for (const line of head.split('\n')) {
+          if (!line.trim()) continue
+          try {
+            const obj = JSON.parse(line)
+            if (typeof obj.cwd === 'string' && obj.cwd) {
+              cwds.push(obj.cwd)
+              break  // got cwd from this file; move on to next dir
+            }
+          } catch { /* incomplete final line — fine */ }
+        }
+      } catch { /* unreadable — fall through */ }
+    }
+  } catch { /* root missing — fine */ }
+  _sessionCwdsCache.set(sessionId, cwds)
+  return cwds
+}
+
+function sessionMatchesCwd(sessionId: string, expectedCwd: string): boolean {
+  const cwds = readAllSessionCwds(sessionId)
+  // No jsonl found means "unknown" (first-time / freshly-resumed
+  // session) — be lenient and treat as valid; mismatch is only a hard
+  // rejection when we have positive evidence the session was started
+  // somewhere else.
+  if (cwds.length === 0) return true
+  return cwds.includes(expectedCwd)
+}
+
+/** Locate the jsonl file for a session id by scanning every claude
+ * project dir. Returns absolute path, or null if not found. */
+function findSessionJsonl(sessionId: string): string | null {
+  const root = join(homedir(), '.claude', 'projects')
+  if (!existsSync(root)) return null
+  try {
+    for (const dir of readdirSync(root)) {
+      const candidate = join(root, dir, `${sessionId}.jsonl`)
+      if (existsSync(candidate)) return candidate
+    }
+  } catch { /* ignore */ }
+  return null
+}
+
+/** Encode a cwd the way Claude does: every non-alphanumeric -> '-'. */
+function encodeCwdForClaude(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-')
+}
+
+/** Copy a session jsonl into a different encoded-cwd dir so that
+ * `claude --resume <sid>` launched from `targetCwd` finds it. Used to
+ * fork a previously-shared session into a project's virtual cwd dir
+ * without touching the original (which the folder-agent tab still
+ * resumes from). Rewrites every line's `cwd` field to `targetCwd` so
+ * the rebranded session also passes sessionMatchesCwd checks (which
+ * read the first-line cwd to defend against encoded-dir collisions
+ * between two-Chinese-char project names). Returns true on success.
+ */
+function copySessionJsonlForCwd(sessionId: string, targetCwd: string): boolean {
+  try {
+    const src = findSessionJsonl(sessionId)
+    if (!src) return false
+    const targetDir = join(homedir(), '.claude', 'projects', encodeCwdForClaude(targetCwd))
+    mkdirSync(targetDir, { recursive: true })
+    const dst = join(targetDir, `${sessionId}.jsonl`)
+    if (src === dst) return true       // already in the right place
+    if (existsSync(dst)) return true   // already forked
+    // Read the source and rewrite each line's cwd field. Each line is
+    // an independent JSON object so we touch them one at a time —
+    // streaming would be cheaper for huge files but these are typically
+    // a few MB and we only do this once per project.
+    const fs = nativeRequire('fs')
+    const content = fs.readFileSync(src, 'utf8') as string
+    const out: string[] = []
+    for (const line of content.split('\n')) {
+      if (!line.trim()) { out.push(line); continue }
+      try {
+        const obj = JSON.parse(line)
+        if (typeof obj.cwd === 'string') obj.cwd = targetCwd
+        out.push(JSON.stringify(obj))
+      } catch {
+        out.push(line)  // malformed line — preserve as-is
+      }
+    }
+    fs.writeFileSync(dst, out.join('\n'), 'utf8')
+    // Update the cache to the new cwd so the verification probe
+    // doesn't re-scan and risk hitting the original (still-pristine)
+    // jsonl in the source dir, which would still report the old cwd.
+    _sessionCwdCache.set(sessionId, targetCwd)
+    return true
+  } catch {
+    return false
+  }
+}
+
 function discoverClaudeSessions(folderPath: string): DiscoveredSession[] {
   // 1. md5 the folder path to get the session-store key
   const hash = createHash('md5').update(folderPath).digest('hex')
@@ -744,6 +1531,1518 @@ function discoverClaudeSessions(folderPath: string): DiscoveredSession[] {
   }]
 }
 
+/**
+ * Parse a single claude session jsonl file to extract:
+ *   - cwd (where this branch ran)
+ *   - first user message (as a human-readable name)
+ *   - line count (message count)
+ *
+ * Streams line-by-line so multi-MB session files don't load into memory.
+ * Early-exits scanning headers for cwd/name once both are known; line count
+ * still requires full scan.
+ */
+async function parseSessionFile(path: string): Promise<{
+  cwd: string | undefined
+  name: string | undefined
+  count: number
+  // Latest event timestamp found in the file (ISO string). Differs from
+  // file mtime because Claude Code appends no-op lines like `permission-mode`
+  // on every `--resume`, bumping mtime without logical activity. We use
+  // this for "last activity" display in the agent list.
+  last_ts: string | undefined
+}> {
+  return new Promise((resolve) => {
+    let cwd: string | undefined
+    let name: string | undefined
+    let last_ts: string | undefined
+    let count = 0
+    const stream = createInterface({
+      input: createReadStream(path, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    })
+    stream.on('line', (line: string) => {
+      if (!line.trim()) return
+      count++
+      try {
+        const obj = JSON.parse(line)
+        if (!cwd && typeof obj.cwd === 'string') cwd = obj.cwd
+        if (!name && obj.type === 'user' && obj.message) {
+          const c = obj.message.content
+          if (typeof c === 'string') {
+            name = c.slice(0, 80).replace(/\n/g, ' ')
+          } else if (Array.isArray(c)) {
+            const t = c.find((x: any) => x.type === 'text')
+            if (t && typeof t.text === 'string') {
+              name = t.text.slice(0, 80).replace(/\n/g, ' ')
+            }
+          }
+        }
+        // Track the max timestamp we see on any line that has one.
+        // permission-mode and last-prompt lines have no timestamp → skipped
+        // naturally, which is exactly what we want.
+        if (typeof obj.timestamp === 'string' && obj.timestamp) {
+          if (!last_ts || obj.timestamp > last_ts) last_ts = obj.timestamp
+        }
+      } catch { /* skip malformed line */ }
+    })
+    stream.on('close', () => resolve({ cwd, name, count, last_ts }))
+    stream.on('error', () => resolve({ cwd, name, count, last_ts }))
+  })
+}
+
+// Cache parsed session metadata keyed by (path, mtime) so repeated view
+// loads don't re-read unchanged .jsonl files. Invalidated automatically
+// whenever a file's mtime changes.
+const sessionCache = new Map<string, {
+  mtimeMs: number
+  cwd: string | undefined
+  name: string | undefined
+  count: number
+  last_ts: string | undefined
+}>()
+
+/**
+ * Enumerate every claude session across ALL known folders.
+ *
+ * Scans ~/.claude/projects/<encoded-cwd>/*.jsonl. Each jsonl is a branch
+ * (session). Returns one entry per file, tagged with the cwd and enriched
+ * from the agents DB if linked. Sorted by last activity desc.
+ *
+ * Cold load can read ~100 files; warm load hits the cache for any file
+ * whose mtime is unchanged.
+ */
+async function listAllClaudeSessions(): Promise<any[]> {
+  const projectsDir = join(homedir(), '.claude', 'projects')
+  if (!existsSync(projectsDir)) return []
+
+  const entries: any[] = []
+  let dirs: string[] = []
+  try { dirs = readdirSync(projectsDir) } catch { return [] }
+
+  const parseJobs: Promise<void>[] = []
+
+  for (const dir of dirs) {
+    const dirPath = join(projectsDir, dir)
+    let files: string[] = []
+    try { files = readdirSync(dirPath).filter(f => f.endsWith('.jsonl')) } catch { continue }
+
+    for (const file of files) {
+      const sessionId = file.replace(/\.jsonl$/, '')
+      const filePath = join(dirPath, file)
+      let stat
+      try { stat = statSync(filePath) } catch { continue }
+
+      const cached = sessionCache.get(filePath)
+      const mtimeIso = stat.mtime.toISOString()
+
+      if (cached && cached.mtimeMs === stat.mtimeMs) {
+        entries.push({
+          session_id: sessionId,
+          folder_path: cached.cwd,
+          name: cached.name ?? sessionId.slice(0, 8),
+          // Prefer the last EVENT timestamp inside the jsonl. File mtime
+          // is unreliable because Claude Code appends no-op `permission-mode`
+          // lines on every --resume, bumping mtime without real activity.
+          last_modified: cached.last_ts ?? mtimeIso,
+          message_count: cached.count,
+          is_db: false,
+        })
+        continue
+      }
+
+      // Miss: stream-parse the file. Push a placeholder now so ordering
+      // stays stable once all jobs resolve.
+      const idx = entries.length
+      entries.push(null)
+      parseJobs.push(
+        parseSessionFile(filePath).then(({ cwd, name, count, last_ts }) => {
+          sessionCache.set(filePath, {
+            mtimeMs: stat!.mtimeMs, cwd, name, count, last_ts,
+          })
+          entries[idx] = {
+            session_id: sessionId,
+            folder_path: cwd,
+            name: name ?? sessionId.slice(0, 8),
+            last_modified: last_ts ?? mtimeIso,
+            message_count: count,
+            is_db: false,
+          }
+        }),
+      )
+    }
+  }
+
+  await Promise.all(parseJobs)
+  const valid = entries.filter(e => e != null && e.folder_path)
+
+  // Merge DB agent metadata (system_prompt, id, project_id, nicer name)
+  const db = getDb()
+  const dbAgents = db.prepare('SELECT * FROM agents').all() as any[]
+  const bySession = new Map(dbAgents.map(a => [a.session_id, a]))
+  // Custom user-/MiMo-generated titles override the auto-derived name.
+  const titles = db.prepare('SELECT session_id, title FROM session_titles').all() as any[]
+  const titleBySession = new Map(titles.map(t => [t.session_id, t.title]))
+  // Folder-alias lookup: if a session's folder_path matches a row in
+  // `objects` of type='folder', prefer "<project> · <alias>" over the
+  // auto-derived first-user-message slice. The first-message slice is
+  // unstable (depends on what the user happened to type first) and
+  // doesn't tell them which lineup project the folder belongs to —
+  // crucial when the same folder is reachable from multiple projects
+  // or has a generic name like "src".
+  const folderRows = db.prepare(
+    "SELECT o.name AS alias, o.target AS folder, p.name AS project_name " +
+    "FROM objects o JOIN projects p ON p.id = o.project_id " +
+    "WHERE o.type = 'folder'"
+  ).all() as Array<{ alias: string; folder: string; project_name: string }>
+  const folderInfo = new Map(folderRows.map(r => [r.folder, r]))
+  for (const e of valid) {
+    const rec = bySession.get(e.session_id)
+    if (rec) {
+      e.id = rec.id
+      e.project_id = rec.project_id
+      e.is_db = true
+      e.system_prompt = rec.system_prompt
+      if (rec.name) e.name = rec.name
+    }
+    const custom = titleBySession.get(e.session_id)
+    if (custom) {
+      e.name = custom
+      continue
+    }
+    // Apply alias-based default ONLY when no explicit title or DB name
+    // exists. This way user-driven renames always win.
+    const dbName = rec?.name as string | undefined
+    if (dbName && dbName.trim()) continue
+    const fa = e.folder_path ? folderInfo.get(e.folder_path) : undefined
+    if (fa) e.name = `${fa.project_name} · ${fa.alias}`
+  }
+
+  valid.sort((a, b) => b.last_modified.localeCompare(a.last_modified))
+  return valid
+}
+
+// ── Session reviewer: parse jsonl into timeline + stats ──────────────────
+
+export interface TimelineEvent {
+  kind: 'user' | 'assistant-text' | 'thinking' | 'tool-use' | 'tool-result' | 'system'
+  ts: string
+  uuid: string
+  parent_uuid?: string
+  // Payload by kind:
+  text?: string              // user / assistant-text / thinking / tool-result / system
+  tool?: {
+    name: string
+    id: string
+    file_path?: string
+    command?: string
+    description?: string
+    added?: number          // lines added (Edit/Write/MultiEdit)
+    removed?: number        // lines removed
+    // summarised input as a single line for display
+    summary: string
+  }
+  tool_use_id?: string       // for tool-result, links back to the tool-use event
+  is_error?: boolean
+}
+
+export interface SessionStats {
+  first_ts: string
+  last_ts: string
+  duration_ms: number
+  user_turns: number
+  assistant_turns: number
+  tool_counts: Record<string, number>
+  file_changes: Array<{ path: string; edits: number; added: number; removed: number }>
+  bash_commands: string[]    // up to 20 most recent, truncated
+  tokens: {
+    input: number
+    output: number
+    cache_read: number
+    cache_creation: number
+  }
+  models: string[]
+  message_count: number      // raw jsonl line count
+  git_branches: string[]
+}
+
+export interface SessionData {
+  session_id: string
+  folder_path: string | null
+  events: TimelineEvent[]
+  stats: SessionStats
+}
+
+// How much text to keep per event. UIs don't need 50KB of a single tool
+// result; previews are enough. Expand on demand if needed later.
+const MAX_TEXT = 4000
+const MAX_TOOL_RESULT = 1200
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + '…' : s
+}
+
+function countLines(s: string): number {
+  if (!s) return 0
+  // "foo\nbar" → 2 lines; "foo" → 1 line; "" → 0
+  let n = 1
+  for (const ch of s) if (ch === '\n') n++
+  return n
+}
+
+/**
+ * Derive (added, removed) line counts for an Edit-style tool call.
+ *
+ * This is an approximation, not a real diff. Good enough for ranking which
+ * files saw the most churn in a session. For Write we only have final
+ * content so removed=0 from lineup's perspective (we don't know the prior
+ * content without reading git).
+ */
+function diffStatFromEdit(oldStr: string, newStr: string): { added: number; removed: number } {
+  return { added: countLines(newStr), removed: countLines(oldStr) }
+}
+
+/**
+ * Pull a concise 1-line summary out of a tool_use input for display in
+ * the timeline. Falls back to the raw JSON if we don't recognise the tool.
+ */
+function summariseToolInput(name: string, input: any): string {
+  if (!input || typeof input !== 'object') return ''
+  switch (name) {
+    case 'Edit':
+    case 'MultiEdit':
+      return String(input.file_path ?? '')
+    case 'Write':
+      return String(input.file_path ?? '')
+    case 'Read': {
+      const lim = input.limit ? ` (${input.limit} 行)` : ''
+      return String(input.file_path ?? '') + lim
+    }
+    case 'Bash': {
+      const cmd = String(input.command ?? '').replace(/\s+/g, ' ').trim()
+      return truncate(cmd, 140)
+    }
+    case 'Grep':
+      return `/${input.pattern ?? ''}/ in ${input.path ?? input.glob ?? '.'}`
+    case 'Glob':
+      return String(input.pattern ?? '')
+    case 'WebFetch':
+    case 'WebSearch':
+      return String(input.url ?? input.query ?? '')
+    case 'TodoWrite':
+      return `${(input.todos ?? []).length} 项`
+    case 'Agent':
+      return String(input.description ?? input.subagent_type ?? '')
+    default: {
+      const kv = Object.entries(input)
+        .filter(([, v]) => typeof v === 'string' || typeof v === 'number')
+        .slice(0, 2)
+        .map(([k, v]) => `${k}=${truncate(String(v), 60)}`)
+        .join(' ')
+      return kv
+    }
+  }
+}
+
+async function parseSessionFull(jsonlPath: string): Promise<SessionData> {
+  const events: TimelineEvent[] = []
+  const tool_counts: Record<string, number> = {}
+  const fileMap = new Map<string, { edits: number; added: number; removed: number }>()
+  const bash_commands: string[] = []
+  const git_branches_set = new Set<string>()
+  const models_set = new Set<string>()
+  let message_count = 0
+  let first_ts = ''
+  let last_ts = ''
+  let user_turns = 0
+  let assistant_turns = 0
+  let session_id = ''
+  let folder_path: string | null = null
+  const tokens = { input: 0, output: 0, cache_read: 0, cache_creation: 0 }
+
+  const stream = createInterface({
+    input: createReadStream(jsonlPath, { encoding: 'utf8' }),
+    crlfDelay: Infinity,
+  })
+
+  for await (const raw of stream) {
+    if (!raw.trim()) continue
+    message_count++
+    let o: any
+    try { o = JSON.parse(raw) } catch { continue }
+
+    if (!session_id && typeof o.sessionId === 'string') session_id = o.sessionId
+    if (!folder_path && typeof o.cwd === 'string') folder_path = o.cwd
+    if (typeof o.gitBranch === 'string' && o.gitBranch) git_branches_set.add(o.gitBranch)
+    const ts = typeof o.timestamp === 'string' ? o.timestamp : ''
+    if (ts) {
+      if (!first_ts || ts < first_ts) first_ts = ts
+      if (!last_ts || ts > last_ts) last_ts = ts
+    }
+
+    if (o.type === 'system' && typeof o.content === 'string') {
+      events.push({
+        kind: 'system', ts, uuid: o.uuid ?? '', parent_uuid: o.parentUuid,
+        text: truncate(o.content, 600),
+      })
+      continue
+    }
+
+    if (o.type === 'user' && o.message) {
+      const content = o.message.content
+      if (typeof content === 'string') {
+        if (content.trim()) {
+          user_turns++
+          events.push({
+            kind: 'user', ts, uuid: o.uuid ?? '', parent_uuid: o.parentUuid,
+            text: truncate(content, MAX_TEXT),
+          })
+        }
+      } else if (Array.isArray(content)) {
+        // Tool results come through as user-role messages with tool_result blocks
+        for (const block of content) {
+          if (!block || typeof block !== 'object') continue
+          if (block.type === 'tool_result') {
+            let text = ''
+            const c = block.content
+            if (typeof c === 'string') text = c
+            else if (Array.isArray(c)) {
+              text = c.map((x: any) => (typeof x === 'string' ? x : x?.text ?? '')).join('\n')
+            }
+            events.push({
+              kind: 'tool-result', ts, uuid: o.uuid ?? '', parent_uuid: o.parentUuid,
+              tool_use_id: block.tool_use_id,
+              is_error: block.is_error === true,
+              text: truncate(text, MAX_TOOL_RESULT),
+            })
+          } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+            user_turns++
+            events.push({
+              kind: 'user', ts, uuid: o.uuid ?? '', parent_uuid: o.parentUuid,
+              text: truncate(block.text, MAX_TEXT),
+            })
+          }
+        }
+      }
+      continue
+    }
+
+    if (o.type === 'assistant' && o.message) {
+      assistant_turns++
+      if (typeof o.message.model === 'string') models_set.add(o.message.model)
+      const u = o.message.usage
+      if (u) {
+        tokens.input += Number(u.input_tokens ?? 0) || 0
+        tokens.output += Number(u.output_tokens ?? 0) || 0
+        tokens.cache_read += Number(u.cache_read_input_tokens ?? 0) || 0
+        tokens.cache_creation += Number(u.cache_creation_input_tokens ?? 0) || 0
+      }
+      const content = o.message.content
+      if (!Array.isArray(content)) continue
+      for (const block of content) {
+        if (!block || typeof block !== 'object') continue
+        if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
+          events.push({
+            kind: 'assistant-text', ts, uuid: o.uuid ?? '', parent_uuid: o.parentUuid,
+            text: truncate(block.text, MAX_TEXT),
+          })
+        } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
+          events.push({
+            kind: 'thinking', ts, uuid: o.uuid ?? '', parent_uuid: o.parentUuid,
+            text: truncate(block.thinking, MAX_TEXT),
+          })
+        } else if (block.type === 'tool_use') {
+          const name = String(block.name ?? '?')
+          tool_counts[name] = (tool_counts[name] ?? 0) + 1
+          const input = block.input ?? {}
+          const tool: TimelineEvent['tool'] = {
+            name,
+            id: String(block.id ?? ''),
+            summary: summariseToolInput(name, input),
+          }
+          if (typeof input.file_path === 'string') tool.file_path = input.file_path
+          if (typeof input.command === 'string') tool.command = input.command
+          if (typeof input.description === 'string') tool.description = input.description
+
+          // Track file churn for the stats panel
+          if (name === 'Edit' && typeof input.file_path === 'string') {
+            const d = diffStatFromEdit(String(input.old_string ?? ''), String(input.new_string ?? ''))
+            tool.added = d.added
+            tool.removed = d.removed
+            const cur = fileMap.get(input.file_path) ?? { edits: 0, added: 0, removed: 0 }
+            cur.edits += 1; cur.added += d.added; cur.removed += d.removed
+            fileMap.set(input.file_path, cur)
+          } else if (name === 'MultiEdit' && typeof input.file_path === 'string' && Array.isArray(input.edits)) {
+            let added = 0, removed = 0
+            for (const e of input.edits) {
+              const d = diffStatFromEdit(String(e?.old_string ?? ''), String(e?.new_string ?? ''))
+              added += d.added; removed += d.removed
+            }
+            tool.added = added; tool.removed = removed
+            const cur = fileMap.get(input.file_path) ?? { edits: 0, added: 0, removed: 0 }
+            cur.edits += 1; cur.added += added; cur.removed += removed
+            fileMap.set(input.file_path, cur)
+          } else if (name === 'Write' && typeof input.file_path === 'string') {
+            const added = countLines(String(input.content ?? ''))
+            tool.added = added; tool.removed = 0
+            const cur = fileMap.get(input.file_path) ?? { edits: 0, added: 0, removed: 0 }
+            cur.edits += 1; cur.added += added
+            fileMap.set(input.file_path, cur)
+          } else if (name === 'Bash' && typeof input.command === 'string') {
+            if (bash_commands.length < 20) bash_commands.push(truncate(input.command, 140))
+          }
+          events.push({
+            kind: 'tool-use', ts, uuid: o.uuid ?? '', parent_uuid: o.parentUuid, tool,
+          })
+        }
+      }
+      continue
+    }
+    // Skip attachment / permission-mode / file-history-snapshot / last-prompt
+    // — these don't carry conversational content worth showing.
+  }
+
+  const duration_ms = first_ts && last_ts
+    ? new Date(last_ts).getTime() - new Date(first_ts).getTime() : 0
+
+  const file_changes = Array.from(fileMap, ([path, v]) => ({ path, ...v }))
+    .sort((a, b) => (b.added + b.removed) - (a.added + a.removed))
+
+  return {
+    session_id,
+    folder_path,
+    events,
+    stats: {
+      first_ts,
+      last_ts,
+      duration_ms,
+      user_turns,
+      assistant_turns,
+      tool_counts,
+      file_changes,
+      bash_commands,
+      tokens,
+      models: Array.from(models_set),
+      message_count,
+      git_branches: Array.from(git_branches_set),
+    },
+  }
+}
+
+// Cache session parse results by (path, mtime). Full-parse is the slow path
+// (~30-300ms per MB), so memoising makes repeated inspector opens instant.
+const sessionDataCache = new Map<string, { mtimeMs: number; data: SessionData }>()
+
+/**
+ * Locate the jsonl for a (folderPath, sessionId) pair. Tries the expected
+ * encoding first; if that misses (e.g. cwd reported in jsonl doesn't round-
+ * trip through Claude's encoding for some edge case), scans every project
+ * dir for a file matching "<sessionId>.jsonl".
+ */
+function findJsonlPath(folderPath: string, sessionId: string): string | null {
+  const projectsDir = join(homedir(), '.claude', 'projects')
+  const encoded = folderPath.replace(/[^a-zA-Z0-9]/g, '-')
+  const primary = join(projectsDir, encoded, `${sessionId}.jsonl`)
+  if (existsSync(primary)) return primary
+  // Fallback: linear scan. ~30 dirs, one readdir each — still fast.
+  let dirs: string[] = []
+  try { dirs = readdirSync(projectsDir) } catch { return null }
+  for (const dir of dirs) {
+    const candidate = join(projectsDir, dir, `${sessionId}.jsonl`)
+    if (existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+async function getSessionData(folderPath: string, sessionId: string): Promise<
+  { ok: true; data: SessionData } | { ok: false; error: string }
+> {
+  try {
+    const jsonlPath = findJsonlPath(folderPath, sessionId)
+    if (!jsonlPath) {
+      return { ok: false, error: `找不到 jsonl：folder=${folderPath} session=${sessionId}` }
+    }
+    const stat = statSync(jsonlPath)
+    const cached = sessionDataCache.get(jsonlPath)
+    if (cached && cached.mtimeMs === stat.mtimeMs) return { ok: true, data: cached.data }
+    const data = await parseSessionFull(jsonlPath)
+    sessionDataCache.set(jsonlPath, { mtimeMs: stat.mtimeMs, data })
+    return { ok: true, data }
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) }
+  }
+}
+
+// ── Session summarizer (OpenRouter API) ──────────────────────────────────
+
+// Ordered fallback list. Try Opus 4.7 first; if OpenRouter returns an
+// error (model gone / region blocked / out of credits on that route),
+// try the next. Pricing is OpenRouter's sticker rate (per MTok, USD).
+interface ModelSpec {
+  slug: string
+  input_per_mtok: number
+  output_per_mtok: number
+}
+// Ordered by preference. Sonnet first — demo showed Opus was overkill for
+// summarisation; Sonnet 4.7 produces comparable output at ~1/5 the price.
+// Opus kept as fallback for rare cases (extremely long sessions where Sonnet
+// refuses or truncates). Others are ultimate fallbacks if Anthropic routes
+// are down.
+const MODEL_FALLBACKS: ModelSpec[] = [
+  { slug: 'anthropic/claude-sonnet-4.7', input_per_mtok: 3,    output_per_mtok: 15 },
+  { slug: 'anthropic/claude-sonnet-4.5', input_per_mtok: 3,    output_per_mtok: 15 },
+  { slug: 'anthropic/claude-opus-4.7',   input_per_mtok: 15,   output_per_mtok: 75 },
+  { slug: 'anthropic/claude-opus-4.5',   input_per_mtok: 15,   output_per_mtok: 75 },
+  { slug: 'openai/gpt-5',                input_per_mtok: 2.5,  output_per_mtok: 10 },
+  { slug: 'google/gemini-2.5-pro',       input_per_mtok: 1.25, output_per_mtok: 10 },
+]
+// Output cap for all our prompts. Long-session L1s were getting truncated
+// at the old 2048 — 10k is plenty for even the most verbose summary while
+// still capping runaway cost.
+const MAX_OUTPUT_TOKENS = 10000
+
+/**
+ * Read the OpenRouter API key. Electron GUI apps don't inherit zshrc env
+ * vars when launched from the dock, so we also grep ~/.zshrc for the
+ * export line as a fallback.
+ *
+ * Priority:
+ *   1. process.env.OPENROUTER_API_KEY
+ *   2. ~/.lineup/openrouter_key (single-line file)
+ *   3. ~/.zshrc `export OPENROUTER_API_KEY=...` line
+ */
+function getOpenRouterKey(): string | null {
+  const envKey = process.env.OPENROUTER_API_KEY
+  if (envKey && envKey.trim()) return envKey.trim()
+  const keyFile = join(LINEUP_DATA_DIR, 'openrouter_key')
+  if (existsSync(keyFile)) {
+    try {
+      const v = readFileSync(keyFile, 'utf8').trim()
+      if (v) return v
+    } catch { /* unreadable */ }
+  }
+  const zshrc = join(homedir(), '.zshrc')
+  if (existsSync(zshrc)) {
+    try {
+      const content = readFileSync(zshrc, 'utf8')
+      const m = content.match(/^\s*export\s+OPENROUTER_API_KEY\s*=\s*["']?([^"'\s]+)["']?/m)
+      if (m && m[1]) return m[1]
+    } catch { /* unreadable */ }
+  }
+  return null
+}
+
+function fmtTs(ts: string): string {
+  if (!ts) return ''
+  const d = new Date(ts)
+  if (Number.isNaN(d.getTime())) return ts
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/**
+ * Compress a SessionData into a compact text "skeleton" for the LLM.
+ *
+ * Strategy: keep the signal (user turns + files touched + tools used),
+ * drop the noise (raw tool results, long paste dumps, assistant chatter).
+ * Budget ≈ 5-10k tokens for even long sessions — cheap and stays well inside
+ * any model's ctx limit.
+ */
+function buildSkeleton(data: SessionData): string {
+  const s = data.stats
+  const lines: string[] = []
+  lines.push('== 会话元数据 ==')
+  lines.push(`folder: ${data.folder_path ?? '?'}`)
+  lines.push(`session_id: ${data.session_id}`)
+  if (s.models.length) lines.push(`model(s): ${s.models.join(', ')}`)
+  lines.push(`start: ${s.first_ts}    end: ${s.last_ts}`)
+  const durMin = Math.round(s.duration_ms / 60000)
+  lines.push(`duration: ${durMin} min`)
+  lines.push(`messages: ${s.message_count} (user ${s.user_turns}, assistant ${s.assistant_turns})`)
+  if (s.git_branches.length) lines.push(`git branches seen: ${s.git_branches.join(', ')}`)
+  lines.push('')
+
+  lines.push('== 工具使用统计 ==')
+  const toolEntries = Object.entries(s.tool_counts).sort((a, b) => b[1] - a[1])
+  for (const [name, n] of toolEntries) lines.push(`  ${name}: ${n}`)
+  lines.push('')
+
+  if (s.file_changes.length) {
+    lines.push('== 文件改动（按 churn 排序，上限 40）==')
+    for (const fc of s.file_changes.slice(0, 40)) {
+      lines.push(`  ${fc.path}  ${fc.edits}x  +${fc.added} -${fc.removed}`)
+    }
+    lines.push('')
+  }
+
+  lines.push('== 用户提问（按时间顺序）==')
+  // Each user turn becomes one bullet. Keep the whole text (cap per-turn
+  // to avoid a single giant paste blowing the budget).
+  let turnIdx = 0
+  for (const e of data.events) {
+    if (e.kind !== 'user' || !e.text) continue
+    turnIdx++
+    const text = e.text.replace(/\s+/g, ' ').trim().slice(0, 800)
+    lines.push(`[${fmtTs(e.ts)}] #${turnIdx} ${text}`)
+  }
+  lines.push('')
+
+  // Errors seen — tool results flagged is_error. Gives the model a signal
+  // about what broke during the session.
+  const errors = data.events
+    .filter(e => e.kind === 'tool-result' && e.is_error)
+    .slice(0, 8)
+  if (errors.length) {
+    lines.push('== 工具错误（最多 8 条）==')
+    for (const e of errors) {
+      lines.push(`[${fmtTs(e.ts)}] ${(e.text ?? '').replace(/\s+/g, ' ').slice(0, 200)}`)
+    }
+    lines.push('')
+  }
+
+  return lines.join('\n')
+}
+
+const SUMMARY_SYSTEM = `你是一个 Claude Code 会话分析助手。用户会提供一次编程会话的结构化摘要（用户提问、工具调用统计、文件改动统计）。你需要为这次会话生成一份中文 Markdown 报告，帮助用户之后回顾。
+
+**输出格式（严格遵守）**：只能出现下面这 5 个二级标题，顺序固定，每个恰好出现一次，不要添加其他标题，不要重复标题：
+
+## 一句话总结
+（单行：目的 + 是否完成 + 关键成果）
+
+## 阶段分解
+3-7 个阶段，每行：**HH:MM-HH:MM 阶段标题**：做了什么、关键文件、关键决策或坑
+
+## 主要文件改动
+3-8 行：文件名 → 这次会话对它的语义层面改动（不是数字）
+
+## 待办 / 未完成
+明确提到但没做完的事（无则写"无"）
+
+## 风险 / 注意事项
+未解决 bug、测试遗漏、技术债（无则写"无"）
+
+保持简洁、信息密度高、不废话。不要在报告之外添加介绍语或结束语。`
+
+/**
+ * Summarize a session via the Anthropic Messages API.
+ *
+ * Cache invariant: (session_id, jsonl mtime) — if the jsonl hasn't changed
+ * since the cached summary was written, return it verbatim. Force=true
+ * bypasses the cache (e.g. user clicks "重新生成").
+ */
+async function summarizeSession(
+  folderPath: string,
+  sessionId: string,
+  opts: { force?: boolean } = {}
+): Promise<
+  | { ok: true; summary: string; cached: boolean; input_tokens: number; output_tokens: number; cost_usd: number; model: string }
+  | { ok: false; error: string }
+> {
+  const jsonlPath = findJsonlPath(folderPath, sessionId)
+  if (!jsonlPath) return { ok: false, error: `找不到 jsonl: ${folderPath} / ${sessionId}` }
+  let stat
+  try { stat = statSync(jsonlPath) } catch (e: any) { return { ok: false, error: e.message } }
+
+  const db = getDb()
+  if (!opts.force) {
+    const cached = db.prepare(
+      'SELECT summary_md, input_tokens, output_tokens, cost_usd, model FROM session_summaries ' +
+      'WHERE session_id = ? AND jsonl_mtime_ms = ?'
+    ).get(sessionId, stat.mtimeMs) as any
+    if (cached) {
+      return {
+        ok: true, cached: true,
+        summary: cached.summary_md,
+        input_tokens: cached.input_tokens,
+        output_tokens: cached.output_tokens,
+        cost_usd: cached.cost_usd,
+        model: cached.model,
+      }
+    }
+  }
+
+  const key = getOpenRouterKey()
+  if (!key) {
+    return {
+      ok: false,
+      error:
+        '未找到 OpenRouter API key。尝试顺序：环境变量 OPENROUTER_API_KEY → ' +
+        '~/.lineup/openrouter_key → ~/.zshrc 里的 export 语句。' +
+        '把 key 放到以上任一位置后重启 lineup。',
+    }
+  }
+
+  const sessionData = await parseSessionFull(jsonlPath)
+  const skeleton = buildSkeleton(sessionData)
+
+  // Try each model in the fallback list; return the first successful one.
+  // Record every error so if they ALL fail, the user sees why.
+  const errors: string[] = []
+  for (const spec of MODEL_FALLBACKS) {
+    let resp
+    try {
+      resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${key}`,
+          // OpenRouter asks for these to surface your app in its analytics;
+          // they're optional but nice to set.
+          'HTTP-Referer': 'https://github.com/your-org/lineup',
+          'X-Title': 'lineup session reviewer',
+        },
+        body: JSON.stringify({
+          model: spec.slug,
+          max_tokens: MAX_OUTPUT_TOKENS,
+          messages: [
+            { role: 'system', content: SUMMARY_SYSTEM },
+            { role: 'user', content: skeleton },
+          ],
+        }),
+      })
+    } catch (e: any) {
+      errors.push(`${spec.slug}: network ${e?.message ?? String(e)}`)
+      continue
+    }
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '')
+      errors.push(`${spec.slug}: ${resp.status} ${text.slice(0, 200)}`)
+      continue
+    }
+    const body: any = await resp.json()
+    const summary = String(body?.choices?.[0]?.message?.content ?? '').trim()
+    if (!summary) {
+      errors.push(`${spec.slug}: empty response`)
+      continue
+    }
+    const input_tokens = Number(body?.usage?.prompt_tokens ?? 0) || 0
+    const output_tokens = Number(body?.usage?.completion_tokens ?? 0) || 0
+    const cost_usd =
+      (input_tokens * spec.input_per_mtok) / 1e6 +
+      (output_tokens * spec.output_per_mtok) / 1e6
+
+    db.prepare(`
+      INSERT INTO session_summaries (
+        session_id, folder_path, jsonl_mtime_ms, model, summary_md,
+        input_tokens, output_tokens, cost_usd
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        folder_path = excluded.folder_path,
+        jsonl_mtime_ms = excluded.jsonl_mtime_ms,
+        model = excluded.model,
+        summary_md = excluded.summary_md,
+        input_tokens = excluded.input_tokens,
+        output_tokens = excluded.output_tokens,
+        cost_usd = excluded.cost_usd,
+        created_at = datetime('now')
+    `).run(
+      sessionId, folderPath, stat.mtimeMs, spec.slug, summary,
+      input_tokens, output_tokens, cost_usd,
+    )
+
+    return {
+      ok: true, cached: false,
+      summary, input_tokens, output_tokens, cost_usd,
+      model: spec.slug,
+    }
+  }
+
+  return {
+    ok: false,
+    error: '所有候选模型都失败了：\n' + errors.join('\n'),
+  }
+}
+
+// ── Hierarchical folder tree (Layer 2 & Layer 3) ─────────────────────────
+
+const ROLLUP_SYSTEM = `你是项目回顾助手。用户会提供若干次相邻或相关的 Claude Code 会话摘要（它们已经被算法聚为一个"阶段"）。请写一份中文 Markdown 总结。
+
+**输出格式（严格遵守）**：只能出现下面这 5 个二级标题，顺序固定，每个恰好出现一次：
+
+## 阶段标题
+单行 10-20 字，抽象核心主题。
+
+## 阶段概要
+2-4 句：时间跨度、核心目标、主要成果、完成度。
+
+## 会话主线
+3-6 个 bullet，按时序排，每条不超过一行。描述会话之间是怎么一步步演进的。
+
+## 关键模块/文件
+2-5 个最核心的改动目标。
+
+## 遗留问题
+如有则列，无则写"无"。
+
+要抽象，不要 copy-paste 子会话的原文。不要添加其他标题。`
+
+function clusterKey(ids: string[]): string {
+  return createHash('sha1').update(ids.slice().sort().join('\n')).digest('hex').slice(0, 16)
+}
+
+function dayGap(a: string, b: string): number {
+  return Math.abs(new Date(b).getTime() - new Date(a).getTime()) / 86400000
+}
+
+function jaccard(a: Iterable<string>, b: Iterable<string>): number {
+  const sa = new Set(a), sb = new Set(b)
+  if (!sa.size || !sb.size) return 0
+  let inter = 0
+  for (const x of sa) if (sb.has(x)) inter++
+  return inter / (sa.size + sb.size - inter)
+}
+
+// Clustering thresholds. Matches the Python demo that the user approved.
+const CLUSTER_GAP_DAYS = 2.0
+const CLUSTER_JACCARD  = 0.20
+
+interface SessionForClustering {
+  session_id: string
+  first_ts: string
+  last_ts: string
+  files: Set<string>
+  data: SessionData   // full parse for skeleton generation
+}
+
+function clusterSessions(sessions: SessionForClustering[]): SessionForClustering[][] {
+  sessions.sort((a, b) => (a.first_ts || '').localeCompare(b.first_ts || ''))
+  const clusters: SessionForClustering[][] = []
+  let cur: SessionForClustering[] = []
+  for (const s of sessions) {
+    if (!cur.length) { cur.push(s); continue }
+    const prev = cur[cur.length - 1]
+    const gap = dayGap(prev.last_ts, s.first_ts)
+    const ov  = jaccard(prev.files, s.files)
+    if (gap <= CLUSTER_GAP_DAYS || ov >= CLUSTER_JACCARD) cur.push(s)
+    else { clusters.push(cur); cur = [s] }
+  }
+  if (cur.length) clusters.push(cur)
+  return clusters
+}
+
+// One OpenRouter round-trip used for both session (L1) and cluster (L2/L3)
+// summaries. Returns the first successful model's result.
+async function openrouterCall(
+  system: string, user: string
+): Promise<
+  | { ok: true; content: string; model: string; input_tokens: number; output_tokens: number; cost_usd: number }
+  | { ok: false; error: string }
+> {
+  const key = getOpenRouterKey()
+  if (!key) return { ok: false, error: '未找到 OpenRouter API key（设置 $OPENROUTER_API_KEY / ~/.lineup/openrouter_key / ~/.zshrc 之一）' }
+  const errors: string[] = []
+  for (const spec of MODEL_FALLBACKS) {
+    let resp
+    try {
+      resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${key}`,
+          'HTTP-Referer': 'https://github.com/your-org/lineup',
+          'X-Title': 'lineup session reviewer',
+        },
+        body: JSON.stringify({
+          model: spec.slug,
+          max_tokens: MAX_OUTPUT_TOKENS,
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user',   content: user },
+          ],
+        }),
+      })
+    } catch (e: any) { errors.push(`${spec.slug}: ${e?.message ?? e}`); continue }
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => '')
+      errors.push(`${spec.slug}: ${resp.status} ${t.slice(0, 200)}`)
+      continue
+    }
+    const body: any = await resp.json()
+    const content = String(body?.choices?.[0]?.message?.content ?? '').trim()
+    if (!content) { errors.push(`${spec.slug}: empty`); continue }
+    const input_tokens = Number(body?.usage?.prompt_tokens ?? 0) || 0
+    const output_tokens = Number(body?.usage?.completion_tokens ?? 0) || 0
+    const cost_usd = (input_tokens * spec.input_per_mtok + output_tokens * spec.output_per_mtok) / 1e6
+    return { ok: true, content, model: spec.slug, input_tokens, output_tokens, cost_usd }
+  }
+  return { ok: false, error: '所有候选模型都失败:\n' + errors.join('\n') }
+}
+
+// Extract a short title from a cluster/root summary: the line after
+// "## 阶段标题" (or the first non-empty line if that heading is absent).
+function extractTitle(summary: string): string {
+  const lines = summary.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s*阶段标题/.test(lines[i])) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const t = lines[j].trim()
+        if (t) return t.slice(0, 60)
+      }
+    }
+  }
+  const first = lines.find(l => l.trim() && !l.startsWith('#'))
+  return (first ?? '(无标题)').trim().slice(0, 60)
+}
+
+export interface FolderTreeNode {
+  level: 1 | 2 | 3
+  key: string          // session_id or cluster_key
+  parent_key?: string
+  title: string
+  summary_md: string
+  first_ts: string
+  last_ts: string
+  session_count: number
+  cost_usd: number
+  model: string
+  // level 2/3 only
+  children?: FolderTreeNode[]
+}
+
+export interface FolderTree {
+  folder_path: string
+  root: FolderTreeNode | null   // L3 node, or null if only one cluster (skip L3)
+  clusters: FolderTreeNode[]    // L2 nodes
+  total_sessions_considered: number
+  total_sessions_skipped: number  // empty sessions
+  total_cost_spent: number        // new API spend this build (cache hits = $0)
+}
+
+/**
+ * Build (or refresh) the hierarchical review tree for one folder. Walks:
+ *   1. all sessions in the folder, skipping empty ones
+ *   2. for each: ensure an L1 summary exists (reuse summarizeSession cache)
+ *   3. cluster by time+file-overlap
+ *   4. for each cluster: roll up children into an L2 summary
+ *   5. if ≥2 clusters: roll them up once more into an L3 root summary
+ *
+ * All rollups are cached in cluster_summaries by (folder, level, cluster_key)
+ * so a second call is $0 if nothing changed.
+ */
+async function buildFolderTree(folderPath: string): Promise<
+  { ok: true; tree: FolderTree } | { ok: false; error: string }
+> {
+  const projectsDir = join(homedir(), '.claude', 'projects')
+  const encoded = folderPath.replace(/[^a-zA-Z0-9]/g, '-')
+  const dir = join(projectsDir, encoded)
+  if (!existsSync(dir)) return { ok: false, error: `找不到目录: ${dir}` }
+  const files = readdirSync(dir).filter(f => f.endsWith('.jsonl'))
+  if (!files.length) return { ok: false, error: `${dir} 下没有 .jsonl` }
+
+  let total_cost_spent = 0
+  let skipped = 0
+  const parsed: SessionForClustering[] = []
+  for (const file of files) {
+    const sessionId = file.replace(/\.jsonl$/, '')
+    const jsonlPath = join(dir, file)
+    const data = await parseSessionFull(jsonlPath)
+    // Filter out empty shells (0 user turns AND 0 tool calls).
+    const toolTotal = Object.values(data.stats.tool_counts).reduce((a, b) => a + b, 0)
+    if (data.stats.user_turns === 0 && toolTotal === 0) { skipped++; continue }
+    parsed.push({
+      session_id: sessionId,
+      first_ts: data.stats.first_ts,
+      last_ts: data.stats.last_ts,
+      files: new Set(data.stats.file_changes.map(fc => fc.path)),
+      data,
+    })
+  }
+
+  if (!parsed.length) return { ok: false, error: '该文件夹下所有会话均为空' }
+
+  // Layer 1: make sure every session has a summary, generating on demand.
+  const db = getDb()
+  const l1ByKey = new Map<string, FolderTreeNode>()
+  for (const s of parsed) {
+    const r = await summarizeSession(folderPath, s.session_id, { force: false })
+    if (!r.ok) return { ok: false, error: `L1 失败 (${s.session_id}): ${r.error}` }
+    if (!r.cached) total_cost_spent += r.cost_usd
+    l1ByKey.set(s.session_id, {
+      level: 1,
+      key: s.session_id,
+      title: extractL1Title(r.summary) || s.session_id.slice(0, 8),
+      summary_md: r.summary,
+      first_ts: s.first_ts,
+      last_ts: s.last_ts,
+      session_count: 1,
+      cost_usd: r.cost_usd,
+      model: r.model,
+    })
+  }
+
+  // Layer 2: cluster + rollup
+  const clusters = clusterSessions(parsed)
+  const clusterNodes: FolderTreeNode[] = []
+  for (const clu of clusters) {
+    const childIds = clu.map(s => s.session_id)
+    const key = clusterKey(childIds)
+    // Hash of the child SUMMARY content — so if any child L1 changed since
+    // this cluster was last rolled up, we invalidate and regenerate.
+    const contentSnapshot = childIds.map(id => l1ByKey.get(id)!.summary_md).join('\n---\n')
+    const contentHash = createHash('sha1').update(contentSnapshot).digest('hex').slice(0, 16)
+    const cached = db.prepare(
+      'SELECT summary_md, title, first_ts, last_ts, session_count, model, cost_usd, content_hash FROM cluster_summaries WHERE folder_path = ? AND level = 2 AND cluster_key = ?'
+    ).get(folderPath, key) as any
+    let node: FolderTreeNode
+    if (cached && cached.content_hash === contentHash) {
+      node = {
+        level: 2, key, title: cached.title, summary_md: cached.summary_md,
+        first_ts: cached.first_ts, last_ts: cached.last_ts,
+        session_count: cached.session_count, cost_usd: cached.cost_usd,
+        model: cached.model, children: [],
+      }
+    } else {
+      const body: string[] = [
+        `# 共 ${clu.length} 次相关会话，时段 ${clu[0].first_ts.slice(0, 10)} → ${clu[clu.length - 1].last_ts.slice(0, 10)}`,
+        '',
+      ]
+      for (const s of clu) {
+        const l1 = l1ByKey.get(s.session_id)!
+        body.push(`## 会话 ${s.session_id.slice(0, 8)} (${s.first_ts.slice(0, 16).replace('T', ' ')})`)
+        body.push(l1.summary_md)
+        body.push('')
+      }
+      const r = await openrouterCall(ROLLUP_SYSTEM, body.join('\n'))
+      if (!r.ok) return { ok: false, error: `L2 失败 (${key}): ${r.error}` }
+      total_cost_spent += r.cost_usd
+      const title = extractTitle(r.content)
+      const firstTs = clu[0].first_ts
+      const lastTs  = clu[clu.length - 1].last_ts
+      db.prepare(`
+        INSERT OR REPLACE INTO cluster_summaries (
+          folder_path, level, cluster_key, child_ids_json, title, summary_md,
+          first_ts, last_ts, session_count, model, input_tokens, output_tokens, cost_usd,
+          content_hash
+        ) VALUES (?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        folderPath, key, JSON.stringify(childIds), title, r.content,
+        firstTs, lastTs, clu.length, r.model,
+        r.input_tokens, r.output_tokens, r.cost_usd,
+        contentHash,
+      )
+      node = {
+        level: 2, key, title, summary_md: r.content,
+        first_ts: firstTs, last_ts: lastTs,
+        session_count: clu.length, cost_usd: r.cost_usd,
+        model: r.model, children: [],
+      }
+    }
+    for (const s of clu) {
+      const child = l1ByKey.get(s.session_id)!
+      child.parent_key = key
+      node.children!.push(child)
+    }
+    clusterNodes.push(node)
+  }
+
+  // Layer 3 (root) only if multiple clusters. A single cluster IS the root.
+  let root: FolderTreeNode | null = null
+  if (clusterNodes.length >= 2) {
+    const childKeys = clusterNodes.map(n => n.key)
+    const key = clusterKey(childKeys)
+    const contentSnapshot = clusterNodes.map(n => n.summary_md).join('\n---\n')
+    const contentHash = createHash('sha1').update(contentSnapshot).digest('hex').slice(0, 16)
+    const cached = db.prepare(
+      'SELECT summary_md, title, first_ts, last_ts, session_count, model, cost_usd, content_hash FROM cluster_summaries WHERE folder_path = ? AND level = 3 AND cluster_key = ?'
+    ).get(folderPath, key) as any
+    if (cached && cached.content_hash === contentHash) {
+      root = {
+        level: 3, key, title: cached.title, summary_md: cached.summary_md,
+        first_ts: cached.first_ts, last_ts: cached.last_ts,
+        session_count: cached.session_count, cost_usd: cached.cost_usd,
+        model: cached.model, children: clusterNodes,
+      }
+    } else {
+      const body: string[] = [
+        `# 文件夹 ${folderPath} 共 ${clusterNodes.length} 个阶段`,
+        '',
+      ]
+      for (let i = 0; i < clusterNodes.length; i++) {
+        const n = clusterNodes[i]
+        body.push(`## 阶段 ${i + 1} (${n.first_ts.slice(0, 10)} – ${n.last_ts.slice(0, 10)}, ${n.session_count} sessions)`)
+        body.push(n.summary_md)
+        body.push('')
+      }
+      const r = await openrouterCall(ROLLUP_SYSTEM, body.join('\n'))
+      if (!r.ok) return { ok: false, error: `L3 失败: ${r.error}` }
+      total_cost_spent += r.cost_usd
+      const title = extractTitle(r.content)
+      const firstTs = clusterNodes[0].first_ts
+      const lastTs  = clusterNodes[clusterNodes.length - 1].last_ts
+      const totalSessions = clusterNodes.reduce((a, b) => a + b.session_count, 0)
+      db.prepare(`
+        INSERT OR REPLACE INTO cluster_summaries (
+          folder_path, level, cluster_key, child_ids_json, title, summary_md,
+          first_ts, last_ts, session_count, model, input_tokens, output_tokens, cost_usd,
+          content_hash
+        ) VALUES (?, 3, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        folderPath, key, JSON.stringify(childKeys), title, r.content,
+        firstTs, lastTs, totalSessions, r.model,
+        r.input_tokens, r.output_tokens, r.cost_usd,
+        contentHash,
+      )
+      root = {
+        level: 3, key, title, summary_md: r.content,
+        first_ts: firstTs, last_ts: lastTs,
+        session_count: totalSessions, cost_usd: r.cost_usd,
+        model: r.model, children: clusterNodes,
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    tree: {
+      folder_path: folderPath,
+      root, clusters: clusterNodes,
+      total_sessions_considered: parsed.length,
+      total_sessions_skipped: skipped,
+      total_cost_spent,
+    },
+  }
+}
+
+/** Pull the "## 一句话总结" line out as a session-level title. */
+function extractL1Title(summary: string): string {
+  const lines = summary.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s*一句话总结/.test(lines[i])) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const t = lines[j].trim()
+        if (t) return t.slice(0, 100)
+      }
+    }
+  }
+  return ''
+}
+
+// ── LLM (via local llm-router) for session titles + bucket summaries ──
+//
+// All LLM calls from the Electron main process go through the local
+// llm-router service (~/utilities/llm-router/, listening on
+// http://127.0.0.1:8765). The router owns API keys (loaded from
+// ~/utilities/llm-router/.env), per-provider concurrency, 429 retry, and
+// cross-provider fallover — none of that has to live here anymore.
+//
+// We previously hit MiMo directly with `fetch` and read MIMO_API_KEY out
+// of the zshrc. Bad: keys had to be in two places, no fallover when MiMo
+// 429'd, and Electron doesn't inherit shell env so users were chasing
+// "key not found" errors after restarts.
+
+const LLM_ROUTER_BASE = process.env.LLM_ROUTER_URL || 'http://127.0.0.1:8765'
+
+// Default model + provider for our reasoning summaries. mimo-v2.5-pro is
+// MiMo's current non-preview pro reasoning model; the router will fall
+// over to other providers (gemini-flash / doubao / claude / deepseek) on
+// 429, dropping the model arg so each provider uses its own default.
+const DEFAULT_REASONING_MODEL = 'mimo-v2.5-pro'
+const DEFAULT_REASONING_PROVIDER = 'mimo'
+
+/**
+ * One-shot chat through the local llm-router. Returns the same shape the
+ * old direct-MiMo `callMimo` did so existing callers don't change.
+ */
+async function callRouter(system: string, user: string, opts: {
+  model?: string
+  preferred?: string
+  maxTokens?: number
+  timeoutSec?: number
+} = {}): Promise<
+  | { ok: true; content: string; input_tokens: number; output_tokens: number }
+  | { ok: false; error: string }
+> {
+  const body: Record<string, unknown> = {
+    system, user,
+    max_tokens: opts.maxTokens ?? 4000,
+    timeout: opts.timeoutSec ?? 180,
+  }
+  if (opts.model) body.model = opts.model
+  if (opts.preferred) body.preferred = opts.preferred
+  let resp: Response
+  try {
+    resp = await fetch(`${LLM_ROUTER_BASE}/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch (e: any) {
+    return {
+      ok: false,
+      error: `llm-router 不可达 (${LLM_ROUTER_BASE}): ${e?.message ?? e}。试试 \`launchctl kickstart -k gui/$(id -u)/com.llm-router\``,
+    }
+  }
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => '')
+    return { ok: false, error: `router HTTP ${resp.status}: ${t.slice(0, 200)}` }
+  }
+  let j: any
+  try { j = await resp.json() } catch (e: any) {
+    return { ok: false, error: `router 返回非 JSON: ${e?.message ?? e}` }
+  }
+  // The /chat endpoint returns {content, input_tokens, output_tokens,
+  // provider_id, model} on success; HTTP 502 on hard failure.
+  const content = String(j?.content ?? '').trim()
+  if (!content) return { ok: false, error: 'router 返回空内容' }
+  return {
+    ok: true,
+    content,
+    input_tokens:  Number(j?.input_tokens ?? 0) || 0,
+    output_tokens: Number(j?.output_tokens ?? 0) || 0,
+  }
+}
+
+/**
+ * Reasoning-quality call (used for time-bucket summaries). Default model:
+ * mimo-v2.5-pro via the mimo provider; router falls over on rate limits.
+ */
+async function callMimo(system: string, user: string): Promise<
+  | { ok: true; content: string; input_tokens: number; output_tokens: number }
+  | { ok: false; error: string }
+> {
+  return callRouter(system, user, {
+    model: DEFAULT_REASONING_MODEL,
+    preferred: DEFAULT_REASONING_PROVIDER,
+    maxTokens: 4000,
+  })
+}
+
+const BUCKET_SYSTEM = `你是 Claude Code 会话时段分析助手。用户会给你一个时间段内的用户提问列表和工具使用统计。你只需要输出**一句话**（中文，≤50 字）概括这个时段主要做了什么。不要输出解释，不要输出标题，只输出那一句话。`
+
+const TITLE_SYSTEM = `你是 Claude Code 会话标题生成器。用户会给你整场会话的用户提问列表和文件改动统计。你需要输出**一个中文标题**：
+- 10-20 字
+- 概括会话核心主题
+- 不加标点、不加书名号、不要引号
+只输出那一行标题，不要输出其他任何内容。`
+
+/**
+ * Build a compact prompt describing a WHOLE session, then ask the router
+ * for a short Chinese title. Reasoning quality matters less than speed
+ * here, but the router will pick whichever provider is live.
+ */
+async function generateSessionTitle(
+  folderPath: string, sessionId: string,
+): Promise<{ ok: true; title: string } | { ok: false; error: string }> {
+  const jsonlPath = findJsonlPath(folderPath, sessionId)
+  if (!jsonlPath) return { ok: false, error: 'jsonl not found' }
+  const data = await parseSessionFull(jsonlPath)
+  const skeleton = buildSkeleton(data)
+  const r = await callRouter(TITLE_SYSTEM, skeleton, {
+    model: DEFAULT_REASONING_MODEL,
+    preferred: DEFAULT_REASONING_PROVIDER,
+    maxTokens: 200,   // titles are 10-20 chars; leave room for reasoning
+  })
+  if (!r.ok) return r
+  // Strip wrap quotes / leading whitespace and take only the first line.
+  const title = r.content.replace(/^[\s"'""`「『]+|[\s"'""`」』]+$/g, '').split('\n')[0]
+  if (!title) return { ok: false, error: 'empty title' }
+  return { ok: true, title }
+}
+
+function fmtHourLabel(h: number): string { return String(h).padStart(2, '0') }
+
+/**
+ * Build a compact prompt for a single time bucket: user turns in order,
+ * plus tool / file counts.
+ */
+function buildBucketSkeleton(
+  events: TimelineEvent[], startTs: string, endTs: string
+): string {
+  const lines: string[] = []
+  lines.push(`== 时段 ${startTs} → ${endTs} ==`)
+  const userTurns = events.filter(e => e.kind === 'user' && e.text)
+  const toolUses = events.filter(e => e.kind === 'tool-use')
+  const toolCounts: Record<string, number> = {}
+  const fileSet = new Set<string>()
+  for (const e of toolUses) {
+    if (!e.tool) continue
+    toolCounts[e.tool.name] = (toolCounts[e.tool.name] ?? 0) + 1
+    if (e.tool.file_path) fileSet.add(e.tool.file_path)
+  }
+  lines.push(`user_turns=${userTurns.length}  tool_calls=${toolUses.length}  files_touched=${fileSet.size}`)
+  if (Object.keys(toolCounts).length) {
+    lines.push('tools: ' + Object.entries(toolCounts)
+      .sort((a, b) => b[1] - a[1]).slice(0, 8)
+      .map(([n, c]) => `${n}×${c}`).join(', '))
+  }
+  if (fileSet.size) {
+    lines.push('files: ' + [...fileSet].slice(0, 6).map(p => p.split('/').pop()).join(', '))
+  }
+  lines.push('')
+  lines.push('== 用户提问（按时序）==')
+  for (let i = 0; i < userTurns.length && i < 40; i++) {
+    const e = userTurns[i]
+    const h = e.ts.slice(11, 16)
+    const text = (e.text ?? '').replace(/\s+/g, ' ').slice(0, 200)
+    lines.push(`[${h}] ${text}`)
+  }
+  if (userTurns.length > 40) lines.push(`... 另 ${userTurns.length - 40} 条`)
+  return lines.join('\n')
+}
+
+/**
+ * Content hash for a set of events: stable key for whether a bucket's
+ * contents have changed. Sorting first so ordering differences don't
+ * invalidate the cache.
+ */
+function bucketContentHash(events: TimelineEvent[]): string {
+  const uuids = events.map(e => e.uuid).filter(Boolean).slice().sort()
+  return createHash('sha1').update(uuids.join('\n')).digest('hex').slice(0, 16)
+}
+
+/**
+ * Lookup-or-generate a bucket summary. Invalidation is by content_hash —
+ * so e.g. yesterday's 08-11 slot stays cached forever once the events in
+ * that window are set in stone, and only the LIVE slot (whose content
+ * keeps changing) incurs repeated calls.
+ */
+async function getOrGenerateBucketSummary(args: {
+  sessionId: string
+  folderPath: string
+  date: string
+  slotIndex: number   // -1 = whole day, 0..5 = slot
+  events: TimelineEvent[]
+}): Promise<
+  | { ok: true; summary: string; cached: boolean; input_tokens: number; output_tokens: number }
+  | { ok: false; error: string }
+> {
+  const db = getDb()
+  const contentHash = bucketContentHash(args.events)
+  const row = db.prepare(
+    'SELECT summary, input_tokens, output_tokens, content_hash ' +
+    'FROM time_bucket_summaries WHERE session_id = ? AND date = ? AND slot_index = ?'
+  ).get(args.sessionId, args.date, args.slotIndex) as any
+  if (row && row.content_hash === contentHash) {
+    return { ok: true, cached: true, summary: row.summary,
+      input_tokens: row.input_tokens, output_tokens: row.output_tokens }
+  }
+  if (!args.events.length) return { ok: false, error: '该时段无事件' }
+
+  const startTs = args.events[0].ts.slice(0, 16).replace('T', ' ')
+  const endTs   = args.events[args.events.length - 1].ts.slice(0, 16).replace('T', ' ')
+  const skeleton = buildBucketSkeleton(args.events, startTs, endTs)
+  const r = await callMimo(BUCKET_SYSTEM, skeleton)
+  if (!r.ok) return r
+  const summary = r.content.replace(/^["'\s]+|["'\s]+$/g, '')
+  db.prepare(`
+    INSERT OR REPLACE INTO time_bucket_summaries
+      (session_id, date, slot_index, content_hash, summary, input_tokens, output_tokens)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    args.sessionId, args.date, args.slotIndex, contentHash, summary,
+    r.input_tokens, r.output_tokens,
+  )
+  return { ok: true, cached: false, summary, input_tokens: r.input_tokens, output_tokens: r.output_tokens }
+}
+
+/**
+ * Bulk endpoint: given a list of buckets, return summary (cached or newly
+ * generated) for each. Runs MiMo calls in parallel with a small concurrency
+ * cap to not hammer the endpoint.
+ */
+async function summarizeBuckets(
+  sessionId: string, folderPath: string,
+  buckets: Array<{ date: string; slot_index: number; event_indices: number[] }>,
+): Promise<Array<{ date: string; slot_index: number; summary: string | null; error?: string }>> {
+  const jsonlPath = findJsonlPath(folderPath, sessionId)
+  if (!jsonlPath) return buckets.map(b => ({ ...b, summary: null, error: 'jsonl not found' }))
+  // Reuse sessionDataCache keyed by (path, mtime) so we don't re-parse a
+  // 31MB jsonl on every summarizeBuckets call — that was what made cache-
+  // hit rounds still feel slow.
+  let stat
+  try { stat = statSync(jsonlPath) } catch { return buckets.map(b => ({ ...b, summary: null, error: 'jsonl stat failed' })) }
+  const cached = sessionDataCache.get(jsonlPath)
+  let data: SessionData
+  if (cached && cached.mtimeMs === stat.mtimeMs) {
+    data = cached.data
+  } else {
+    data = await parseSessionFull(jsonlPath)
+    sessionDataCache.set(jsonlPath, { mtimeMs: stat.mtimeMs, data })
+  }
+
+  const results = new Array<{ date: string; slot_index: number; summary: string | null; error?: string }>(buckets.length)
+  // Keep this modest — the local llm-router has its own per-provider
+  // semaphore (mimo: 2, openrouter: 6, ...). A higher CONCURRENCY here
+  // just builds up queue depth without producing results any faster.
+  const CONCURRENCY = 2
+  let next = 0
+  async function worker() {
+    while (true) {
+      const idx = next++
+      if (idx >= buckets.length) return
+      const b = buckets[idx]
+      const events = b.event_indices.map(i => data.events[i]).filter(Boolean)
+      const r = await getOrGenerateBucketSummary({
+        sessionId, folderPath, date: b.date, slotIndex: b.slot_index, events,
+      })
+      results[idx] = r.ok
+        ? { date: b.date, slot_index: b.slot_index, summary: r.summary }
+        : { date: b.date, slot_index: b.slot_index, summary: null, error: r.error }
+    }
+  }
+  await Promise.all(Array(Math.min(CONCURRENCY, buckets.length)).fill(0).map(worker))
+  return results
+}
+
+/**
+ * Read-only: get the cached tree for a folder without calling the API.
+ * Missing pieces are indicated by `root: null` or empty clusters.
+ */
+function getCachedFolderTree(folderPath: string): FolderTree | null {
+  const db = getDb()
+  const l2rows = db.prepare(
+    'SELECT cluster_key, child_ids_json, title, summary_md, first_ts, last_ts, session_count, model, cost_usd ' +
+    'FROM cluster_summaries WHERE folder_path = ? AND level = 2 ORDER BY first_ts'
+  ).all(folderPath) as any[]
+  if (!l2rows.length) return null
+
+  const clusters: FolderTreeNode[] = []
+  for (const row of l2rows) {
+    const childIds: string[] = JSON.parse(row.child_ids_json)
+    const children: FolderTreeNode[] = []
+    for (const sid of childIds) {
+      const s = db.prepare(
+        'SELECT summary_md, model, cost_usd FROM session_summaries WHERE session_id = ?'
+      ).get(sid) as any
+      if (!s) continue
+      children.push({
+        level: 1, key: sid,
+        parent_key: row.cluster_key,
+        title: extractL1Title(s.summary_md) || sid.slice(0, 8),
+        summary_md: s.summary_md,
+        first_ts: '', last_ts: '',
+        session_count: 1, cost_usd: s.cost_usd, model: s.model,
+      })
+    }
+    clusters.push({
+      level: 2, key: row.cluster_key, title: row.title, summary_md: row.summary_md,
+      first_ts: row.first_ts, last_ts: row.last_ts,
+      session_count: row.session_count, cost_usd: row.cost_usd, model: row.model,
+      children,
+    })
+  }
+
+  const l3row = db.prepare(
+    'SELECT cluster_key, child_ids_json, title, summary_md, first_ts, last_ts, session_count, model, cost_usd ' +
+    'FROM cluster_summaries WHERE folder_path = ? AND level = 3 LIMIT 1'
+  ).get(folderPath) as any
+  const root: FolderTreeNode | null = l3row ? {
+    level: 3, key: l3row.cluster_key, title: l3row.title, summary_md: l3row.summary_md,
+    first_ts: l3row.first_ts, last_ts: l3row.last_ts,
+    session_count: l3row.session_count, cost_usd: l3row.cost_usd, model: l3row.model,
+    children: clusters,
+  } : null
+
+  return {
+    folder_path: folderPath,
+    root, clusters,
+    total_sessions_considered: clusters.reduce((a, c) => a + c.session_count, 0),
+    total_sessions_skipped: 0,
+    total_cost_spent: 0,
+  }
+}
+
 interface TerminalWindow {
   window_id: number
   tab: number
@@ -754,14 +3053,16 @@ interface TerminalWindow {
 
 /**
  * Query terminal-mcp for the list of open Terminal.app windows + their cwd.
- * Delegates to the python module at ~/terminal-mcp so the same
- * logic is used by lineup, the MCP server, and any other agent.
+ * Delegates to the optional terminal-mcp python module (set TERMINAL_MCP_DIR
+ * env var to its checkout path, defaults to `~/terminal-mcp/`). Returns an
+ * empty list if terminal-mcp isn't installed locally.
  */
 function listTerminalWindows(): TerminalWindow[] {
   const { execSync } = require('child_process') as typeof import('child_process')
+  const terminalMcpDir = process.env.TERMINAL_MCP_DIR || join(homedir(), 'terminal-mcp')
   const py = `
 import sys, json
-sys.path.insert(0, '${join(homedir(), "terminal-mcp")}')
+sys.path.insert(0, ${JSON.stringify(terminalMcpDir)})
 from terminal_mcp.server import _get_windows, _get_cwd_by_tty
 out = []
 for w in _get_windows():
@@ -838,6 +3139,39 @@ tell application "Terminal"
     reopen
     activate
     do script "cd '${escapedCwd}' && claude"
+end tell
+tell application "System Events"
+    set frontmost of (first process whose name is "Terminal") to true
+end tell
+`
+  return new Promise((resolve) => {
+    execFile('osascript', ['-e', script], (err) => {
+      if (err) resolve({ ok: false, reused: false, error: err.message })
+      else resolve({ ok: true, reused: false })
+    })
+  })
+}
+
+/**
+ * Open Terminal.app with a new window, cd into `cwd`, and pre-fill
+ * `command` on the prompt line WITHOUT executing it (zsh `print -z`).
+ *
+ * Used by the agent reviewer's "在 Terminal 打开" button — the user sees
+ * e.g. `claude --resume abc123` already typed so they can hit Enter to
+ * run or edit first.
+ */
+async function openExternalTerminalWithCommand(
+  cwd: string, command: string
+): Promise<OpenTerminalResult> {
+  // Escape for embedding inside a single-quoted shell string.
+  const esc = (s: string) => s.replace(/'/g, "'\\''")
+  // print -z only works in zsh; our users' default shell is zsh (checked
+  // via .zshrc). Fall back to `echo '<cmd>'` if print -z isn't available.
+  const script = `
+tell application "Terminal"
+    reopen
+    activate
+    do script "cd '${esc(cwd)}' && print -z '${esc(command)}'"
 end tell
 tell application "System Events"
     set frontmost of (first process whose name is "Terminal") to true
@@ -1002,7 +3336,7 @@ function resolveZoteroChildrenBatch(keys: string[]): Map<string, boolean> {
   const { execFileSync } = require('child_process') as typeof import('child_process')
   const py = `
 import sys
-sys.path.insert(0, '${LINEUP_ROOT}')
+sys.path.insert(0, ${JSON.stringify(LINEUP_ROOT)})
 from lineup.plugins.zotero import collection_has_children
 print(','.join('1' if collection_has_children(k) else '0' for k in sys.argv[1:]))
 `
@@ -1158,6 +3492,7 @@ function registerIpc(): void {
     const rows = db.prepare(`
       SELECT p.* FROM projects p
       WHERE (p.type IS NULL OR p.type = 'project')
+        AND (p.is_inbox = 0 OR p.is_inbox IS NULL)
         AND (
           p.pinned = 1
           OR NOT EXISTS (SELECT 1 FROM project_parents pp WHERE pp.project_id = p.id)
@@ -1165,28 +3500,24 @@ function registerIpc(): void {
         ${includeArchived ? '' : 'AND (p.archived IS NULL OR p.archived = 0)'}
       ORDER BY p.pinned DESC, p.priority DESC, p.name
     `).all() as any[]
+    // Same root-color resolution as getSubProjects: walk up the tree,
+    // colors count only from ROOT-level ancestors (projects with no parents).
+    const rootColorStmt = db.prepare(`
+      WITH RECURSIVE anc(id) AS (
+        SELECT ?
+        UNION
+        SELECT pp.parent_id FROM project_parents pp
+        JOIN anc a ON pp.project_id = a.id
+      )
+      SELECT DISTINCT p.color FROM projects p
+      WHERE p.id IN (SELECT id FROM anc)
+        AND p.color IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM project_parents pp2 WHERE pp2.project_id = p.id)
+    `)
     for (const r of rows) {
       r.progress = computeProgress(r)
-      // Resolve inherited colors for pinned sub-projects that don't have
-      // their own color set. Root projects use their own color directly.
-      if (r.color) {
-        r._rootColors = [r.color]
-      } else if (r.pinned) {
-        const ancestors = db.prepare(`
-          WITH RECURSIVE anc(id, depth) AS (
-            SELECT parent_id, 1 FROM project_parents WHERE project_id = ?
-            UNION ALL
-            SELECT pp.parent_id, a.depth + 1 FROM project_parents pp
-            JOIN anc a ON pp.project_id = a.id WHERE a.depth < 20
-          )
-          SELECT DISTINCT p.color FROM projects p
-          WHERE p.id IN (SELECT id FROM anc) AND p.color IS NOT NULL
-            AND NOT EXISTS (SELECT 1 FROM project_parents pp2 WHERE pp2.project_id = p.id)
-        `).all(r.id) as { color: string }[]
-        r._rootColors = ancestors.map(a => a.color)
-      } else {
-        r._rootColors = []
-      }
+      const roots = rootColorStmt.all(r.id) as { color: string }[]
+      r._rootColors = roots.map(a => a.color)
     }
     return rows
   })
@@ -1233,11 +3564,24 @@ function registerIpc(): void {
     return true
   }
 
-  function computeProgress(row: { id: number; type: string; status: string }): number {
+  function computeProgress(
+    row: { id: number; type: string; status: string },
+    visited: Set<number> = new Set(),
+  ): number {
     if (row.type === 'step') return row.status === 'done' ? 100 : 0
     // Check recurring reset before treating as "done"
     maybeResetRecurring(row)
     if (row.status === 'done') return 100
+
+    // Cycle guard: project_parents is a DAG by convention but the DB
+    // doesn't enforce it. If we re-enter the same node mid-recursion,
+    // bail with the cached value to avoid an infinite loop.
+    if (visited.has(row.id)) {
+      const cached = db.prepare('SELECT progress FROM projects WHERE id = ?')
+        .get(row.id) as { progress: number } | undefined
+      return cached?.progress ?? 0
+    }
+    visited.add(row.id)
 
     if (row.type === 'task') {
       const stats = db.prepare(`
@@ -1254,21 +3598,34 @@ function registerIpc(): void {
       return val
     }
 
-    // project: weighted avg of direct children (tasks + sub-projects)
+    // project: weighted avg of direct children (tasks + sub-projects).
+    // For each child we recurse via computeProgress so a leaf status
+    // change far down the tree propagates immediately — without this
+    // recursion, a sub-project whose own grandchildren are all done
+    // still reports the stale cached progress (often 0), dragging the
+    // parent's weighted average down even though everything under it
+    // is actually complete. (Symptom we hit pre-fix: a sub-project was
+    // shown at 0% because nobody had directly opened it since its
+    // children finished.)
     const children = db.prepare(`
-      SELECT p.progress, p.important, p.urgent, p.status
+      SELECT p.id, p.type, p.important, p.urgent, p.status
       FROM projects p
       JOIN project_parents pp ON p.id = pp.project_id
       WHERE pp.parent_id = ? AND p.type IN ('task', 'project')
     `).all(row.id) as Array<{
-      progress: number; important: number; urgent: number; status: string
+      id: number; type: string; important: number; urgent: number; status: string
     }>
     if (children.length === 0) return 0
     let totalW = 0
     let sumWP = 0
     for (const c of children) {
       const w = (c.important ? 2 : 1) * (c.urgent ? 1.5 : 1)
-      const prog = c.status === 'done' ? 100 : (c.progress || 0)
+      const prog = c.status === 'done'
+        ? 100
+        : computeProgress(
+            { id: c.id, type: c.type, status: c.status },
+            visited,
+          )
       totalW += w
       sumWP += prog * w
     }
@@ -1295,22 +3652,31 @@ function registerIpc(): void {
         p.name
     `).all(parentId) as any[]
 
-    // Get the parent's own color (used as the fast-path for all children)
-    const parentRow = db.prepare('SELECT color FROM projects WHERE id = ?').get(parentId) as { color: string | null } | undefined
-    const parentColor = parentRow?.color ?? null
+    // For each child project, compute its ROOT ancestor colors properly.
+    // Rules:
+    //  - A "root" is a project with NO parent row (truly top-level).
+    //  - Root colors propagate down to all descendants.
+    //  - A project's OWN color only counts if it IS a root (no parents).
+    //  - Non-root projects should never have color set (only roots can),
+    //    but stale data from before that rule might exist → we ignore it.
+    const rootColorStmt = db.prepare(`
+      WITH RECURSIVE anc(id) AS (
+        SELECT ?
+        UNION
+        SELECT pp.parent_id FROM project_parents pp
+        JOIN anc a ON pp.project_id = a.id
+      )
+      SELECT DISTINCT p.color FROM projects p
+      WHERE p.id IN (SELECT id FROM anc)
+        AND p.color IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM project_parents pp2 WHERE pp2.project_id = p.id)
+    `)
 
     for (const r of rows) {
       r.progress = computeProgress(r)
-      // Pre-compute root colors so ProjectColorDot doesn't need its own IPC.
-      // Fast path: if parent has a color, children inherit it.
       if (r.type === 'project' || !r.type) {
-        if (parentColor) {
-          r._rootColors = [parentColor]
-        } else if (r.color) {
-          r._rootColors = [r.color]
-        } else {
-          r._rootColors = []  // gray fallback
-        }
+        const roots = rootColorStmt.all(r.id) as { color: string }[]
+        r._rootColors = roots.map(x => x.color)
       }
     }
     return rows
@@ -1360,30 +3726,57 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('db:deleteProject', (_e, id: number) => {
-    // Cascade: collect all descendants (BFS), then delete everything.
-    const collectDescendants = (rootId: number): number[] => {
-      const all: number[] = [rootId]
-      const queue: number[] = [rootId]
-      const seen = new Set<number>([rootId])
-      while (queue.length > 0) {
-        const cur = queue.shift()!
-        const kids = db.prepare(
-          'SELECT project_id FROM project_parents WHERE parent_id = ?'
-        ).all(cur) as { project_id: number }[]
-        for (const k of kids) {
-          if (seen.has(k.project_id)) continue
-          seen.add(k.project_id)
-          all.push(k.project_id)
+    // Never delete the reserved inbox project
+    const row = db.prepare('SELECT is_inbox FROM projects WHERE id = ?').get(id) as { is_inbox: number } | undefined
+    if (row?.is_inbox === 1) {
+      throw new Error('收件箱项目不可删除')
+    }
+
+    // Multi-parent-aware delete:
+    //  1. BFS find all reachable descendants of the target
+    //  2. A descendant is truly deleted ONLY if ALL its parents are inside
+    //     this subtree. If it has any parent outside, it survives — only
+    //     the links into this subtree are removed.
+    //  3. The target itself is always fully deleted.
+    const reachable = new Set<number>([id])
+    const queue = [id]
+    while (queue.length > 0) {
+      const cur = queue.shift()!
+      const kids = db.prepare(
+        'SELECT project_id FROM project_parents WHERE parent_id = ?'
+      ).all(cur) as { project_id: number }[]
+      for (const k of kids) {
+        if (!reachable.has(k.project_id)) {
+          reachable.add(k.project_id)
           queue.push(k.project_id)
         }
       }
-      return all
     }
 
-    const allIds = collectDescendants(id)
+    // Compute the actual delete set: target + descendants with no external parents
+    const toDelete = new Set<number>([id])
+    for (const pid of reachable) {
+      if (pid === id) continue
+      const parents = db.prepare(
+        'SELECT parent_id FROM project_parents WHERE project_id = ?'
+      ).all(pid) as { parent_id: number }[]
+      const externalCount = parents.filter(p => !reachable.has(p.parent_id)).length
+      if (externalCount === 0) {
+        toDelete.add(pid)
+      }
+      // Else: survives — only its links to deleted ancestors will be removed
+    }
 
     const trx = db.transaction(() => {
-      for (const pid of allIds) {
+      // Step 1: for survivors in `reachable \ toDelete`, unlink from deleted ancestors
+      for (const pid of reachable) {
+        if (toDelete.has(pid)) continue
+        for (const delId of toDelete) {
+          db.prepare('DELETE FROM project_parents WHERE project_id = ? AND parent_id = ?').run(pid, delId)
+        }
+      }
+      // Step 2: fully delete each project in toDelete + its objects/todos/agents
+      for (const pid of toDelete) {
         db.prepare('DELETE FROM objects WHERE project_id = ?').run(pid)
         db.prepare('DELETE FROM todos WHERE project_id = ?').run(pid)
         db.prepare('DELETE FROM agents WHERE project_id = ?').run(pid)
@@ -1444,29 +3837,44 @@ function registerIpc(): void {
     // type defaults to 'project'. Valid values: 'project' | 'task' | 'step'.
     const safeType = type === 'task' || type === 'step' ? type : 'project'
     const trx = db.transaction(() => {
-      // Inheritance / defaults depend on the child type:
-      //  - project : no auto-fields; user fills them in later
-      //  - task    : inherit important/urgent from parent project,
-      //              default due_at to today (user can clear)
-      //  - step    : order_index = max(sibling steps' order_index) + 1
-      //              so manual and agent-created steps share a stable order
+      // Inheritance rules:
+      //  - task/step inherit: important, urgent, due_at, reminder_every_days
+      //    from their parent (a task inherits from its project, a step from
+      //    its task, a project inherits from its project parent if it has
+      //    one — siblings of another project).
+      //  - recurring_days (the is-recurring flag) is NEVER inherited — that's
+      //    a property of a specific item, not a lineage thing.
+      //  - task without an explicit inherited due still defaults to today
+      //    so quick-created tasks show up in Today view. Step without an
+      //    inherited due stays null (steps are sequential inside a task —
+      //    if the task has no due, the step has no due either).
       let important = 0
       let urgent = 0
       let due_at: string | null = null
+      let reminder_every_days: number | null = null
       let order_index: number | null = null
 
-      if (safeType === 'task') {
+      if (safeType === 'task' || safeType === 'step') {
         const parent = db.prepare(
-          'SELECT important, urgent FROM projects WHERE id = ?'
-        ).get(parentId) as { important?: number; urgent?: number } | undefined
+          'SELECT important, urgent, due_at, reminder_every_days FROM projects WHERE id = ?'
+        ).get(parentId) as {
+          important?: number; urgent?: number;
+          due_at?: string | null; reminder_every_days?: number | null
+        } | undefined
         important = parent?.important ? 1 : 0
         urgent = parent?.urgent ? 1 : 0
-        // ISO date YYYY-MM-DD of the user's local today
-        const d = new Date()
-        const y = d.getFullYear()
-        const m = String(d.getMonth() + 1).padStart(2, '0')
-        const day = String(d.getDate()).padStart(2, '0')
-        due_at = `${y}-${m}-${day}`
+        due_at = parent?.due_at ?? null
+        reminder_every_days = parent?.reminder_every_days ?? null
+        // Fallback for tasks that inherited no due: default to today so
+        // quick-add tasks show up in the Today view. Steps without an
+        // inherited due stay null.
+        if (safeType === 'task' && !due_at) {
+          const d = new Date()
+          const y = d.getFullYear()
+          const m = String(d.getMonth() + 1).padStart(2, '0')
+          const day = String(d.getDate()).padStart(2, '0')
+          due_at = `${y}-${m}-${day}`
+        }
       }
       if (safeType === 'step') {
         const maxRow = db.prepare(`
@@ -1479,14 +3887,55 @@ function registerIpc(): void {
       }
 
       const info = db.prepare(
-        `INSERT INTO projects (name, type, priority, important, urgent, due_at, order_index)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(name, safeType, priority || 3, important, urgent, due_at, order_index)
+        `INSERT INTO projects (name, type, priority, important, urgent, due_at, reminder_every_days, order_index)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(name, safeType, priority || 3, important, urgent, due_at, reminder_every_days, order_index)
       const childId = info.lastInsertRowid
       db.prepare(
         'INSERT INTO project_parents (project_id, parent_id) VALUES (?, ?)'
       ).run(childId, parentId)
       return childId
+    })
+    return trx()
+  })
+
+  /**
+   * Insert a new step immediately before or after an existing step.
+   * Shifts later siblings' order_index by +1 so the new row slots in cleanly.
+   */
+  ipcMain.handle('db:insertStepRelative', (_e, args: {
+    neighborId: number
+    position: 'before' | 'after'
+    name: string
+  }) => {
+    const trx = db.transaction(() => {
+      const neighbor = db.prepare(
+        'SELECT id, type, order_index FROM projects WHERE id = ?'
+      ).get(args.neighborId) as { id: number; type: string; order_index: number | null } | undefined
+      if (!neighbor) throw new Error(`step ${args.neighborId} not found`)
+      if (neighbor.type !== 'step') throw new Error(`not a step: id=${args.neighborId} type=${neighbor.type}`)
+      const parentRow = db.prepare(
+        'SELECT parent_id FROM project_parents WHERE project_id = ? LIMIT 1'
+      ).get(args.neighborId) as { parent_id: number } | undefined
+      if (!parentRow) throw new Error('step has no parent')
+      const parentId = parentRow.parent_id
+      const neighborOrder = neighbor.order_index ?? 0
+      const newOrder = args.position === 'before' ? neighborOrder : neighborOrder + 1
+      // Shift all sibling steps with order_index >= newOrder by +1.
+      db.prepare(`
+        UPDATE projects SET order_index = order_index + 1
+        WHERE type = 'step' AND order_index >= ?
+          AND id IN (SELECT project_id FROM project_parents WHERE parent_id = ?)
+      `).run(newOrder, parentId)
+      const info = db.prepare(
+        `INSERT INTO projects (name, type, priority, important, urgent, order_index)
+         VALUES (?, 'step', 3, 0, 0, ?)`
+      ).run(args.name, newOrder)
+      const newId = info.lastInsertRowid
+      db.prepare(
+        'INSERT INTO project_parents (project_id, parent_id) VALUES (?, ?)'
+      ).run(newId, parentId)
+      return newId
     })
     return trx()
   })
@@ -1501,6 +3950,169 @@ function registerIpc(): void {
       'INSERT INTO objects (project_id, name, target, type) VALUES (?, ?, ?, ?)'
     ).run(projectId, name, target, type)
     return info.lastInsertRowid
+  })
+
+  // Generic "引用到…" / "副本到…" picker backend. Given a source
+  // (project/task/step/object), returns the set of valid destination
+  // parents per lineup's containment rules:
+  //   project / task → can live under a project
+  //   step          → can live under a task
+  //   object        → can live under a project or task
+  // Excludes the source itself and its descendants (would create a
+  // cycle in project_parents). Returns each destination with a /-joined
+  // breadcrumb so the picker can disambiguate same-named projects.
+  ipcMain.handle('db:listCopyDestinations', (_e, args: {
+    sourceKind: 'project' | 'object'
+    sourceId: number
+  }) => {
+    // Determine the source's effective subtype.
+    let sourceType: 'project' | 'task' | 'step' | 'object' = 'object'
+    if (args.sourceKind === 'project') {
+      const row = db.prepare('SELECT type FROM projects WHERE id = ?').get(args.sourceId) as
+        { type: string | null } | undefined
+      const t = (row?.type ?? 'project') as 'project' | 'task' | 'step'
+      sourceType = t
+    }
+    // Valid destination types per containment rules.
+    const acceptableDestTypes: Array<'project' | 'task'> = (() => {
+      if (sourceType === 'project') return ['project']
+      if (sourceType === 'task') return ['project']
+      if (sourceType === 'step') return ['task']
+      return ['project', 'task']  // object
+    })()
+
+    // For projects, walk descendants to exclude them. project_parents is
+    // a DAG, so BFS is enough; same node won't blow up the visited set.
+    const excluded = new Set<number>()
+    if (args.sourceKind === 'project') {
+      excluded.add(args.sourceId)
+      const queue: number[] = [args.sourceId]
+      const childrenStmt = db.prepare(
+        'SELECT project_id FROM project_parents WHERE parent_id = ?'
+      )
+      while (queue.length > 0) {
+        const id = queue.shift()!
+        const kids = childrenStmt.all(id) as Array<{ project_id: number }>
+        for (const k of kids) {
+          if (excluded.has(k.project_id)) continue
+          excluded.add(k.project_id)
+          queue.push(k.project_id)
+        }
+      }
+      // Also exclude direct existing parents — already linked, picker
+      // shouldn't offer them again. (We use `addProjectParent` which is
+      // idempotent, but the user shouldn't see "already linked" entries.)
+      const parents = db.prepare(
+        'SELECT parent_id FROM project_parents WHERE project_id = ?'
+      ).all(args.sourceId) as Array<{ parent_id: number }>
+      for (const p of parents) excluded.add(p.parent_id)
+    } else {
+      // Object source: exclude its current project_id (already linked
+      // there). Multi-parent for objects is achieved by INSERTing a
+      // second row, but no point offering its own home as a target.
+      const row = db.prepare('SELECT project_id FROM objects WHERE id = ?')
+        .get(args.sourceId) as { project_id: number } | undefined
+      if (row) excluded.add(row.project_id)
+    }
+
+    const placeholders = acceptableDestTypes.map(() => '?').join(',')
+    const rows = db.prepare(
+      `SELECT id, name, type FROM projects
+       WHERE COALESCE(type, 'project') IN (${placeholders})
+         AND (archived IS NULL OR archived = 0)
+       ORDER BY name`
+    ).all(...acceptableDestTypes) as Array<{ id: number; name: string; type: string | null }>
+
+    // Build breadcrumbs via project_parents walk. Cap depth to avoid
+    // pathological cycles (shouldn't exist but defense in depth).
+    const breadcrumb = (id: number): string => {
+      const chain: string[] = []
+      const seen = new Set<number>()
+      let cur: number | null = id
+      let depth = 0
+      while (cur !== null && depth++ < 16 && !seen.has(cur)) {
+        seen.add(cur)
+        const row: { name: string; parent_id: number | null } | undefined = db.prepare(
+          'SELECT p.name, pp.parent_id ' +
+          'FROM projects p LEFT JOIN project_parents pp ON pp.project_id = p.id ' +
+          'WHERE p.id = ? ORDER BY pp.parent_id LIMIT 1'
+        ).get(cur) as { name: string; parent_id: number | null } | undefined
+        if (!row) break
+        chain.unshift(row.name)
+        cur = row.parent_id
+      }
+      return chain.join(' / ')
+    }
+
+    return rows
+      .filter(r => !excluded.has(r.id))
+      .map(r => ({
+        id: r.id,
+        name: r.name,
+        type: r.type ?? 'project',
+        breadcrumb: breadcrumb(r.id),
+      }))
+  })
+
+  // Materialize the picked reference. project/task/step → second
+  // parent edge; object → second row in `objects` pointing at the
+  // same target. Returns { ok, error? } so the renderer can show
+  // failure inline rather than just disappearing.
+  ipcMain.handle('db:createReference', (_e, args: {
+    sourceKind: 'project' | 'object'
+    sourceId: number
+    destId: number
+  }) => {
+    if (args.sourceKind === 'project') {
+      if (args.sourceId === args.destId) {
+        return { ok: false, error: '不能引用到自己' }
+      }
+      // Defense: refuse if dest is a descendant of source (cycle).
+      // listCopyDestinations should already filter this, but the
+      // renderer could call createReference directly from drag-drop
+      // later, so re-check here.
+      const seen = new Set<number>([args.destId])
+      const queue: number[] = [args.destId]
+      while (queue.length > 0) {
+        const id = queue.shift()!
+        if (id === args.sourceId) {
+          return { ok: false, error: '不能引用到自身的子项目（会成环）' }
+        }
+        const parents = db.prepare(
+          'SELECT parent_id FROM project_parents WHERE project_id = ?'
+        ).all(id) as Array<{ parent_id: number }>
+        for (const p of parents) {
+          if (!seen.has(p.parent_id)) {
+            seen.add(p.parent_id)
+            queue.push(p.parent_id)
+          }
+        }
+      }
+      const existing = db.prepare(
+        'SELECT 1 FROM project_parents WHERE project_id = ? AND parent_id = ?'
+      ).get(args.sourceId, args.destId)
+      if (existing) return { ok: false, error: '已经引用过了' }
+      db.prepare(
+        'INSERT INTO project_parents (project_id, parent_id) VALUES (?, ?)'
+      ).run(args.sourceId, args.destId)
+      return { ok: true }
+    }
+    // Object source: dedup by (project_id, target, type) — same row
+    // already exists in dest? do nothing. Otherwise INSERT a clone of
+    // the source's name/target/type under destId.
+    const obj = db.prepare(
+      'SELECT name, target, type, default_app FROM objects WHERE id = ?'
+    ).get(args.sourceId) as
+      { name: string; target: string; type: string; default_app: string | null } | undefined
+    if (!obj) return { ok: false, error: '源对象不存在' }
+    const dup = db.prepare(
+      'SELECT id FROM objects WHERE project_id = ? AND target = ? AND type = ?'
+    ).get(args.destId, obj.target, obj.type)
+    if (dup) return { ok: false, error: '目标项目已存在相同对象' }
+    db.prepare(
+      'INSERT INTO objects (project_id, name, target, type, default_app) VALUES (?, ?, ?, ?, ?)'
+    ).run(args.destId, obj.name, obj.target, obj.type, obj.default_app)
+    return { ok: true }
   })
 
   // Project reference/move: add a second parent link (reference) or
@@ -1589,6 +4201,62 @@ function registerIpc(): void {
   // ~/.claude_sessions/<md5(cwd)> which we then read back on subsequent
   // loads and store on the project row.
 
+  // ── Project main-agent CLAUDE.md.manual editing ──────────────────────
+  // CLAUDE.md is auto-generated on every ensureMainAgent (header + inventory);
+  // CLAUDE.md.manual is a user-owned overlay that gets stacked into CLAUDE.md
+  // and is never overwritten. The Inspector / ChatPanel "📝 CLAUDE.md"
+  // button reads + writes this file; the actual claude system prompt the
+  // agent sees is regenerated by syncProjectVirtualFolder on next mount.
+
+  ipcMain.handle('project:readManual', (_e, projectId: number) => {
+    const row = db.prepare('SELECT name FROM projects WHERE id = ?').get(projectId) as
+      { name: string } | undefined
+    if (!row) return { ok: false, error: 'project not found' }
+    const dir = virtualProjectDirById(projectId, row.name)
+    const manualPath = join(dir, 'CLAUDE.md.manual')
+    const stackedPath = join(dir, 'CLAUDE.md')
+    const manual = existsSync(manualPath) ? readFileSync(manualPath, 'utf8') : ''
+    const stacked = existsSync(stackedPath) ? readFileSync(stackedPath, 'utf8') : ''
+    return { ok: true, manual, stacked, manualPath, stackedPath }
+  })
+
+  ipcMain.handle('project:writeManual', (_e, args: { projectId: number; content: string }) => {
+    const row = db.prepare(
+      'SELECT id, name, description FROM projects WHERE id = ?'
+    ).get(args.projectId) as { id: number; name: string; description: string | null } | undefined
+    if (!row) return { ok: false, error: 'project not found' }
+    const dir = virtualProjectDirById(row.id, row.name)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'CLAUDE.md.manual'), args.content, 'utf8')
+    // Re-stack so the agent reads the new overlay on its next CLAUDE.md
+    // pull (claude reloads on each turn). Reuses the same logic that
+    // ensureMainAgent runs.
+    syncProjectVirtualFolder(row)
+    return { ok: true }
+  })
+
+  // Walk project_parents from `pid` up to the root, return [root, ..., pid]
+  // as {id, name}. Used by the ChatPanel "📁 打开项目" button to drill the
+  // Miller column path.
+  ipcMain.handle('project:listAncestors', (_e, projectId: number) => {
+    const out: Array<{ id: number; name: string }> = []
+    const seen = new Set<number>()
+    let cur: number | null = projectId
+    while (cur != null && !seen.has(cur)) {
+      seen.add(cur)
+      const row = db.prepare(
+        'SELECT id, name FROM projects WHERE id = ?'
+      ).get(cur) as { id: number; name: string } | undefined
+      if (!row) break
+      out.unshift(row)
+      const parent = db.prepare(
+        'SELECT parent_id FROM project_parents WHERE project_id = ? LIMIT 1'
+      ).get(cur) as { parent_id: number | null } | undefined
+      cur = parent?.parent_id ?? null
+    }
+    return { ok: true, ancestors: out }
+  })
+
   ipcMain.handle('project:ensureMainAgent', (_e, projectId: number) => {
     const row = db.prepare(
       'SELECT id, name, description, main_agent_session_id FROM projects WHERE id = ?'
@@ -1597,25 +4265,101 @@ function registerIpc(): void {
     } | undefined
     if (!row) return null
 
-    const cwd = syncProjectVirtualFolder(row)
+    // Project main agent ALWAYS runs in the synthesized virtual folder.
+    // It's logically distinct from any folder-agent tab the user might
+    // open on the linked folder — same encoded cwd → shared jsonl dir →
+    // sessions stomp on each other. The virtual folder has its own
+    // CLAUDE.md (header + inventory) and an objects/ subdir of symlinks
+    // to the real linked folder, so the main agent can still navigate to
+    // the user's actual files.
+    const virtualCwd = syncProjectVirtualFolder(row)
+    const cwd = virtualCwd
 
-    // If we don't yet have a stored session id, try reading the wrapper's
-    // cache file (~/.claude_sessions/<md5(cwd)>). If that exists, promote
-    // it to projects.main_agent_session_id so future opens resume directly.
-    let sessionId = row.main_agent_session_id
+    // One-shot fork: if main_agent_session_id was set under the OLD
+    // shared-cwd design (its jsonl lives in the linked-folder encoded
+    // dir, not the virtual one), copy the jsonl into the virtual encoded
+    // dir so claude --resume from `cwd` picks up the existing history.
+    // The original jsonl stays put, which is what the folder-agent tab
+    // resumes from — both can now diverge cleanly.
+    if (row.main_agent_session_id) {
+      const expectedDir = join(homedir(), '.claude', 'projects', encodeCwdForClaude(cwd))
+      const existingPath = findSessionJsonl(row.main_agent_session_id)
+      if (existingPath && !existingPath.startsWith(expectedDir + '/')) {
+        copySessionJsonlForCwd(row.main_agent_session_id, cwd)
+      }
+    }
+
+    // Resolve session id with progressive fallbacks. Each candidate must
+    // pass the cwd verification — Claude's per-cwd jsonl directory is
+    // keyed by `cwd.replace(/[^a-zA-Z0-9]/g, '-')`, which collapses
+    // multi-char Chinese folder names to identical strings (e.g. 学习 and
+    // 事工 both encode to `--`), so two projects' sessions can pile up in
+    // the same encoded dir. Picking by mtime alone cross-wires them.
+    // We instead read each candidate jsonl's recorded `cwd` field and
+    // require it to match the project's expected cwd before trusting it.
+
+    let sessionId: string | null = row.main_agent_session_id
+    if (sessionId) {
+      const jsonlPath = findSessionJsonl(sessionId)
+      if (!jsonlPath) {
+        // Ghost session id: nothing on disk. `claude --resume <id>`
+        // would fail with "No conversation found". This commonly
+        // happens when an earlier ensureMainAgent stored the id of a
+        // pty that died before claude actually wrote a jsonl, or when
+        // a jsonl got cleaned up by something else. Heal and let the
+        // fallback below pick a real session.
+        db.prepare('UPDATE projects SET main_agent_session_id = NULL WHERE id = ?')
+          .run(projectId)
+        sessionId = null
+      } else if (!sessionMatchesCwd(sessionId, cwd)) {
+        // DB row points at a session that wasn't even started in this cwd.
+        // Almost certainly a previous-bug write where the encoding-collision
+        // jsonl scan picked a sibling project's session. Heal the row.
+        db.prepare('UPDATE projects SET main_agent_session_id = NULL WHERE id = ?')
+          .run(projectId)
+        sessionId = null
+      }
+    }
+
     if (!sessionId) {
       const md5 = createHash('md5').update(cwd).digest('hex')
       const cacheFile = join(homedir(), '.claude_sessions', md5)
       if (existsSync(cacheFile)) {
         try {
           const stored = readFileSync(cacheFile, 'utf8').trim()
-          if (stored) {
-            sessionId = stored
-            db.prepare('UPDATE projects SET main_agent_session_id = ? WHERE id = ?')
-              .run(sessionId, projectId)
-          }
+          if (stored && sessionMatchesCwd(stored, cwd)) sessionId = stored
         } catch { /* ignore */ }
       }
+    }
+
+    if (!sessionId) {
+      // Last resort: scan ~/.claude/projects/<encoded-cwd>/ for the
+      // newest jsonl whose recorded cwd actually matches. Encoding
+      // collisions mean the dir may contain other projects' sessions —
+      // filter aggressively.
+      try {
+        const encoded = cwd.replace(/[^a-zA-Z0-9]/g, '-')
+        const projDir = join(homedir(), '.claude', 'projects', encoded)
+        if (existsSync(projDir)) {
+          const files = readdirSync(projDir).filter(f => f.endsWith('.jsonl'))
+          let best: { id: string; mtime: number } | null = null
+          for (const f of files) {
+            const sid = f.replace(/\.jsonl$/, '')
+            if (!sessionMatchesCwd(sid, cwd)) continue
+            const stat = statSync(join(projDir, f))
+            const mtime = stat.mtimeMs
+            if (!best || mtime > best.mtime) {
+              best = { id: sid, mtime }
+            }
+          }
+          if (best) sessionId = best.id
+        }
+      } catch { /* ignore */ }
+    }
+
+    if (sessionId && sessionId !== row.main_agent_session_id) {
+      db.prepare('UPDATE projects SET main_agent_session_id = ? WHERE id = ?')
+        .run(sessionId, projectId)
     }
 
     return { cwd, sessionId }
@@ -1634,8 +4378,23 @@ function registerIpc(): void {
     const allowed = new Set([
       'start_at', 'due_at', 'reminder_every_days', 'last_reminded_at',
       'important', 'urgent', 'status', 'order_index',
-      'color', 'archived', 'pinned', 'recurring_days',
+      'color', 'archived', 'pinned', 'recurring_days', 'completed_at',
     ])
+    // Auto-stamp completed_at on done-flip so the column UI can show
+    // "✓ 完成于 X" without each caller having to set it explicitly.
+    if (Object.prototype.hasOwnProperty.call(patch, 'status')
+        && !Object.prototype.hasOwnProperty.call(patch, 'completed_at')) {
+      const newStatus = patch.status
+      const cur = db.prepare('SELECT status, completed_at FROM projects WHERE id = ?')
+        .get(id) as { status?: string; completed_at?: string | null } | undefined
+      if (newStatus === 'done' && cur?.status !== 'done') {
+        const d = new Date()
+        const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+        ;(patch as any).completed_at = today
+      } else if (newStatus !== 'done' && cur?.status === 'done') {
+        ;(patch as any).completed_at = null
+      }
+    }
     const cols: string[] = []
     const vals: unknown[] = []
     for (const [k, v] of Object.entries(patch)) {
@@ -1651,6 +4410,85 @@ function registerIpc(): void {
     if (cols.length === 0) return
     vals.push(id)
     db.prepare(`UPDATE projects SET ${cols.join(', ')} WHERE id = ?`).run(...vals)
+
+    // Step due → parent task: if a step's due is later than its parent
+    // task's due, bump the parent up. We don't shrink — the parent's due
+    // can be later than every step (just means there's slack). This is
+    // ONLY for steps; bumping up a project/task chain isn't requested.
+    if (Object.prototype.hasOwnProperty.call(patch, 'due_at') && patch.due_at) {
+      const row = db.prepare(`
+        SELECT t.id AS task_id, t.due_at AS task_due, p.type AS step_type
+        FROM projects p
+        LEFT JOIN project_parents pp ON pp.project_id = p.id
+        LEFT JOIN projects t ON t.id = pp.parent_id AND t.type = 'task'
+        WHERE p.id = ?
+      `).get(id) as { task_id?: number | null; task_due?: string | null; step_type?: string } | undefined
+      if (row?.step_type === 'step' && row.task_id) {
+        const stepDue = String(patch.due_at).slice(0, 10)
+        const taskDue = row.task_due ? row.task_due.slice(0, 10) : null
+        if (taskDue == null || stepDue > taskDue) {
+          db.prepare('UPDATE projects SET due_at = ? WHERE id = ?')
+            .run(stepDue, row.task_id)
+        }
+      }
+    }
+  })
+
+  // For a step row, return the bounds the user can pick for its due_at:
+  //   - min: latest due_at among earlier sibling steps (so steps stay
+  //     monotonically non-decreasing in due date — a step shouldn't be
+  //     "due" before one that has to happen first). null if no earlier
+  //     siblings have a due.
+  //   - parent_due: the parent task's current due_at, used as the soft
+  //     ceiling. Picking a step due > parent_due bumps the parent up
+  //     (handled in setProjectMeta), so this is informational only.
+  ipcMain.handle('db:getStepDueBounds', (_e, stepId: number) => {
+    const row = db.prepare(`
+      SELECT s.order_index AS step_order, t.id AS task_id,
+             t.due_at AS parent_due
+      FROM projects s
+      JOIN project_parents pp ON pp.project_id = s.id
+      JOIN projects t ON t.id = pp.parent_id AND t.type = 'task'
+      WHERE s.id = ?
+    `).get(stepId) as { step_order?: number | null; task_id?: number; parent_due?: string | null } | undefined
+    if (!row || !row.task_id) return { min: null, parent_due: null }
+    // Earlier siblings = steps under same task with order_index < me.
+    const minRow = db.prepare(`
+      SELECT MAX(s.due_at) AS mx
+      FROM projects s
+      JOIN project_parents pp ON pp.project_id = s.id
+      WHERE pp.parent_id = ? AND s.type = 'step'
+        AND s.id != ?
+        AND COALESCE(s.order_index, 0) < COALESCE(?, 0)
+        AND s.due_at IS NOT NULL
+    `).get(row.task_id, stepId, row.step_order ?? 0) as { mx?: string | null } | undefined
+    return {
+      min: minRow?.mx ? minRow.mx.slice(0, 10) : null,
+      parent_due: row.parent_due ? row.parent_due.slice(0, 10) : null,
+    }
+  })
+
+  // Count active steps under a task + report whether the parent task is
+  // recurring. Today view uses this to decide whether to prompt on
+  // last-step completion: if the task is recurring, completing the last
+  // step is just one cycle and a fresh batch of steps will reappear when
+  // `maybeResetRecurring` fires — no need to ask the user.
+  ipcMain.handle('db:countActiveStepsForTask', (_e, taskId: number) => {
+    const cnt = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM projects s
+      JOIN project_parents pp ON pp.project_id = s.id
+      WHERE pp.parent_id = ?
+        AND s.type = 'step'
+        AND s.status NOT IN ('done', 'cancelled')
+    `).get(taskId) as { n: number } | undefined
+    const task = db.prepare(
+      "SELECT recurring_days FROM projects WHERE id = ?"
+    ).get(taskId) as { recurring_days: number | null } | undefined
+    return {
+      remaining: cnt?.n ?? 0,
+      parentRecurring: !!(task?.recurring_days && task.recurring_days > 0),
+    }
   })
 
   // ── P3 views: today / eisenhower / inbox ───────────────────────
@@ -1660,88 +4498,159 @@ function registerIpc(): void {
   // view can show a "in: <project>" breadcrumb. Tasks with no parent
   // are considered "inbox".
 
+  // Frontier-aware task view:
+  //   - If a task has NO active steps → show the task itself
+  //   - If a task has active steps → hide the task, show its *first active
+  //     step* (the "frontier"). The returned row carries task_id/task_name
+  //     so the UI can render a "task ▸ step" breadcrumb.
+  // parent_id/parent_name/parent_color always points at the grandparent
+  // project — clicking the breadcrumb gets you to the project context
+  // regardless of whether the row itself is a task or a step.
+  // Aggregated views (Today / Eisenhower / Inbox) should show each task
+  // exactly ONCE even when it's referenced under multiple parents via
+  // project_parents (multi-parent / 引用 feature). A plain LEFT JOIN to
+  // project_parents would multiply the row by the number of parents. We
+  // pin the parent edge to the canonical one (smallest parent_id, which
+  // happens to be the earliest-linked since IDs are autoincrement) so
+  // the join produces at most one row per task.
   const TASK_VIEW_SELECT = `
+    -- Tasks that have no active step (leaf tasks or all-steps-done)
     SELECT
       t.*,
-      parent.id   AS parent_id,
-      parent.name AS parent_name,
-      parent.color AS parent_color
+      parent.id    AS parent_id,
+      parent.name  AS parent_name,
+      parent.color AS parent_color,
+      NULL AS task_id,
+      NULL AS task_name
     FROM projects t
-    LEFT JOIN project_parents pp ON pp.project_id = t.id
+    LEFT JOIN project_parents pp
+      ON pp.project_id = t.id
+      AND pp.parent_id = (
+        SELECT MIN(parent_id) FROM project_parents WHERE project_id = t.id
+      )
     LEFT JOIN projects parent ON parent.id = pp.parent_id
     WHERE t.type = 'task'
+      AND t.status NOT IN ('done', 'cancelled')
+      AND NOT EXISTS (
+        SELECT 1 FROM projects s
+        JOIN project_parents pps ON pps.project_id = s.id
+        WHERE pps.parent_id = t.id
+          AND s.type = 'step'
+          AND s.status NOT IN ('done', 'cancelled')
+      )
+
+    UNION ALL
+
+    -- Frontier steps of tasks that DO have active steps. Steps can
+    -- only have one parent task by construction (no multi-parent for
+    -- steps) so the pps join here is naturally 1:1; the multi-parent
+    -- concern is on the task t, where we again pin to the canonical
+    -- parent edge.
+    SELECT
+      s.*,
+      proj.id    AS parent_id,
+      proj.name  AS parent_name,
+      proj.color AS parent_color,
+      t.id       AS task_id,
+      t.name     AS task_name
+    FROM projects s
+    JOIN project_parents pps ON pps.project_id = s.id
+    JOIN projects t ON t.id = pps.parent_id AND t.type = 'task'
+    LEFT JOIN project_parents ppt
+      ON ppt.project_id = t.id
+      AND ppt.parent_id = (
+        SELECT MIN(parent_id) FROM project_parents WHERE project_id = t.id
+      )
+    LEFT JOIN projects proj ON proj.id = ppt.parent_id
+    WHERE s.type = 'step'
+      AND s.status NOT IN ('done', 'cancelled')
+      AND t.status NOT IN ('done', 'cancelled')
+      AND s.order_index = (
+        SELECT MIN(s2.order_index) FROM projects s2
+        JOIN project_parents pps2 ON pps2.project_id = s2.id
+        WHERE pps2.parent_id = t.id
+          AND s2.type = 'step'
+          AND s2.status NOT IN ('done', 'cancelled')
+      )
   `
 
   ipcMain.handle('db:getTodayTasks', () => {
-    // A task is in "today" if:
-    //   - status != done/cancelled, AND
-    //   - (due_at <= today OR the reminder window has elapsed)
-    //
-    // Reminder window: reminder_every_days != NULL AND
-    //   (last_reminded_at IS NULL OR date(last_reminded_at)+N days <= today)
+    // A row is in "today" if its due_at <= today OR its recurring reminder
+    // window has elapsed. After the frontier rewrite the filter applies to
+    // whatever row we're actually showing (task or its active step) — and
+    // since step creation now inherits due_at from its task, steps land in
+    // Today correctly.
     return db.prepare(`
-      ${TASK_VIEW_SELECT}
-        AND t.status NOT IN ('done', 'cancelled')
-        AND (
-          (t.due_at IS NOT NULL AND date(t.due_at) <= date('now', 'localtime'))
-          OR (
-            t.reminder_every_days IS NOT NULL
-            AND (
-              t.last_reminded_at IS NULL
-              OR date(t.last_reminded_at, '+' || t.reminder_every_days || ' days') <= date('now', 'localtime')
-            )
+      SELECT * FROM (${TASK_VIEW_SELECT}) r
+      WHERE
+        (r.due_at IS NOT NULL AND date(r.due_at) <= date('now', 'localtime'))
+        OR (
+          r.reminder_every_days IS NOT NULL
+          AND (
+            r.last_reminded_at IS NULL
+            OR date(r.last_reminded_at, '+' || r.reminder_every_days || ' days') <= date('now', 'localtime')
           )
         )
       ORDER BY
-        CASE WHEN t.due_at IS NULL THEN 1 ELSE 0 END,
-        t.due_at,
-        t.important DESC,
-        t.urgent DESC
+        CASE WHEN r.due_at IS NULL THEN 1 ELSE 0 END,
+        r.due_at,
+        r.important DESC,
+        r.urgent DESC
     `).all()
   })
 
   ipcMain.handle('db:getEisenhowerTasks', () => {
-    // All active tasks. The renderer groups them into 4 quadrants.
-    // Effective urgency = urgent=1 OR due_at <= today+3 days (auto-urgent).
+    // All active rows (task-without-steps OR frontier-step), grouped into
+    // 4 quadrants in the renderer. Effective urgency = urgent=1 OR due_at
+    // within 3 days.
     return db.prepare(`
-      ${TASK_VIEW_SELECT}
-        AND t.status NOT IN ('done', 'cancelled')
+      SELECT * FROM (${TASK_VIEW_SELECT}) r
       ORDER BY
-        t.important DESC,
-        t.urgent DESC,
-        CASE WHEN t.due_at IS NULL THEN 1 ELSE 0 END,
-        t.due_at
+        r.important DESC,
+        r.urgent DESC,
+        CASE WHEN r.due_at IS NULL THEN 1 ELSE 0 END,
+        r.due_at
     `).all()
   })
 
   ipcMain.handle('db:getInboxTasks', () => {
-    // "Orphan" tasks: task rows with no row in project_parents. These
-    // are created via Quick Add (⌘N) and sit here until the user drags
-    // them into a real project.
+    // Tasks under the reserved "收件箱" project (is_inbox=1).
     return db.prepare(`
       SELECT
         t.*,
-        NULL as parent_id, NULL as parent_name, NULL as parent_color
+        ib.id as parent_id, ib.name as parent_name, ib.color as parent_color
       FROM projects t
+      JOIN project_parents pp ON pp.project_id = t.id
+      JOIN projects ib ON ib.id = pp.parent_id AND ib.is_inbox = 1
       WHERE t.type = 'task'
         AND t.status NOT IN ('done', 'cancelled')
-        AND NOT EXISTS (
-          SELECT 1 FROM project_parents pp WHERE pp.project_id = t.id
-        )
       ORDER BY t.created_at DESC
     `).all()
   })
 
   /**
-   * Quick-add: create an orphan task that lands in the Inbox view.
-   * No project_parents row, no inherited flags — user fills details later
-   * or drags the task into a real project.
+   * Quick-add: create a task under the reserved inbox project. User can
+   * drag it out to another project later.
    */
   ipcMain.handle('db:quickAddTask', (_e, name: string) => {
-    const info = db.prepare(
-      `INSERT INTO projects (name, type, priority, status) VALUES (?, 'task', 3, 'todo')`
-    ).run(name)
-    return info.lastInsertRowid
+    const inbox = db.prepare('SELECT id FROM projects WHERE is_inbox = 1 LIMIT 1').get() as { id: number } | undefined
+    const trx = db.transaction(() => {
+      const info = db.prepare(
+        `INSERT INTO projects (name, type, priority, status) VALUES (?, 'task', 3, 'todo')`
+      ).run(name)
+      const taskId = info.lastInsertRowid as number
+      if (inbox) {
+        db.prepare('INSERT INTO project_parents (project_id, parent_id) VALUES (?, ?)').run(taskId, inbox.id)
+      }
+      return taskId
+    })
+    return trx()
+  })
+
+  /** Resolve the inbox project id so the renderer can navigate to it. */
+  ipcMain.handle('db:getInboxProjectId', () => {
+    const row = db.prepare('SELECT id FROM projects WHERE is_inbox = 1 LIMIT 1').get() as { id: number } | undefined
+    return row?.id ?? null
   })
 
   // Current steps: for each task under this project, get the first
@@ -1820,7 +4729,8 @@ function registerIpc(): void {
     // type system via `uv run lu open <name> --project <project>`.
     // This keeps all open logic in one place (lineup/types/).
     const obj = db.prepare(`
-      SELECT o.name as obj_name, p.name as project_name
+      SELECT o.name as obj_name, o.type as obj_type, o.target as obj_target,
+             p.name as project_name
       FROM objects o JOIN projects p ON o.project_id = p.id
       WHERE o.id = ?
     `).get(objectId) as any
@@ -1854,6 +4764,7 @@ function registerIpc(): void {
       { name: 'zotero', label: 'zotero文献', placeholder: 'zotero://select/library/items/...' },
       { name: 'obsidian', label: 'Obsidian 笔记', placeholder: 'Obsidian vault 内的文件路径' },
       { name: 'trilium', label: 'Trilium 笔记', placeholder: 'Trilium noteId (如 DPS7i6SnoUwy)' },
+      { name: 'mail', label: 'Apple Mail 邮件', placeholder: 'message://<Message-ID>' },
       { name: 'script', label: '脚本', placeholder: '脚本路径 (如 ~/scripts/run.sh)' },
     ]
   })
@@ -1879,6 +4790,32 @@ function registerIpc(): void {
     return runBrowseCli('trilium', parentId)
   })
 
+  ipcMain.handle('browse:mail', async (_e, path: string) => {
+    return runBrowseCli('mail', path)
+  })
+
+  // Refresh the Mail cache. Can take a while on first run (Mail.app's
+  // JXA is slow) — the renderer should show a "syncing..." spinner.
+  ipcMain.handle('mail:sync', async () => {
+    return new Promise<{ ok: boolean; error?: string; total?: number }>((resolve) => {
+      const args = ['run', '--directory', LINEUP_ROOT, 'lu', 'mail', 'sync']
+      execFile('uv', args, { cwd: LINEUP_ROOT, maxBuffer: 4 * 1024 * 1024, timeout: 300_000 },
+        (err, stdout) => {
+          if (err) {
+            resolve({ ok: false, error: err.message })
+            return
+          }
+          try {
+            const parsed = JSON.parse(stdout.trim())
+            resolve(parsed)
+          } catch (e: any) {
+            resolve({ ok: false, error: 'parse: ' + (e?.message ?? e) })
+          }
+        }
+      )
+    })
+  })
+
   ipcMain.handle('browse:zotero', async (_e, path: string) => {
     return runBrowseCli('zotero', path)
   })
@@ -1893,6 +4830,83 @@ function registerIpc(): void {
 
   ipcMain.handle('clipboard:writeText', async (_e, text: string) => {
     clipboard.writeText(text)
+  })
+
+  // ── Settings page actions ──────────────────────────────────────────
+  // Lightweight maintenance IPCs. Each clears one cache (mail bodies /
+  // pipeline replay history / prompt yaml history) without touching
+  // canonical state — re-fetch / re-record happens automatically on
+  // the next pulse. Used by the ⚙ 设置 page.
+
+  ipcMain.handle('settings:clearMailPreviewCache', () => {
+    try {
+      const db = getDb()
+      const r = db.prepare('DELETE FROM mail_preview_cache').run()
+      return { ok: true, removed: r.changes }
+    } catch (e: any) {
+      return { ok: false, error: e?.message ?? String(e) }
+    }
+  })
+
+  // Filesystem stats for the settings page — DB size, log size, cache row counts.
+  ipcMain.handle('settings:stats', () => {
+    const out: Record<string, unknown> = {}
+    try {
+      const dbPath = join(LINEUP_DATA_DIR, 'lineup.db')
+      out.dbSize = existsSync(dbPath) ? statSync(dbPath).size : 0
+      out.dbPath = dbPath
+      const memLog = join(LINEUP_DATA_DIR, 'memory_log.jsonl')
+      out.memLogSize = existsSync(memLog) ? statSync(memLog).size : 0
+      out.memLogPath = memLog
+      const db = getDb()
+      out.mailPreviewCount = (db.prepare(
+        'SELECT COUNT(*) AS n FROM mail_preview_cache'
+      ).get() as { n: number }).n
+      out.lineupHome = LINEUP_DATA_DIR
+    } catch (e: any) {
+      out.error = e?.message ?? String(e)
+    }
+    return out
+  })
+
+  // Read clipboard for terminal paste. When the user copies a file in
+  // Finder (⌘C), the clipboard holds a file URL — we want to paste the
+  // path string into the pty (matching Terminal.app's behavior),
+  // NOT have xterm.js render it as an image. Returns:
+  //   { files: string[], text: string }
+  // For multi-file Finder copies macOS uses the NSFilenamesPboardType
+  // bplist; for the single-file path Electron exposes 'public.file-url'
+  // directly. We try the bplist first, fall back to the single URL.
+  ipcMain.handle('clipboard:readForTerminal', () => {
+    const out = { files: [] as string[], text: '' }
+    try {
+      const formats = clipboard.availableFormats()
+      if (formats.includes('public.file-url') ||
+          formats.includes('NSFilenamesPboardType') ||
+          formats.includes('Apple URL pasteboard type')) {
+        // Multi-file: NSFilenamesPboardType bplist. Parsing bplist is
+        // hairy without a dep, but Electron exposes a parsed-out
+        // helper via `readBuffer('NSFilenamesPboardType')` only as raw
+        // bytes. So for the common case (one file) we use the
+        // public.file-url single-value read which is just a file://
+        // URL string.
+        try {
+          const single = clipboard.read('public.file-url')
+          if (single) {
+            const u = new URL(single)
+            const path = decodeURIComponent(u.pathname)
+            if (path) out.files.push(path)
+          }
+        } catch { /* fall through */ }
+      }
+      // Always also fetch text in case the paste handler wants it as
+      // a fallback.
+      out.text = clipboard.readText() || ''
+    } catch {
+      // Clipboard read can throw if unavailable; ignore — caller
+      // already handles the empty case.
+    }
+    return out
   })
 
   ipcMain.handle('shell:openInVscode', async (_e, path: string) => {
@@ -1913,12 +4927,44 @@ function registerIpc(): void {
       }
       if (type === 'trilium') {
         // Use the same TriliumNext server URL the type module emits
-        await shell.openExternal(`http://localhost:37840/#root/${target}`)
+        await shell.openExternal(`http://100.108.137.82:37840/#root/${target}`)
+        return { ok: true }
+      }
+      // Mail scheme — mailrow:N needs resolving to message://<MID> because
+      // only message:// is registered with Mail.app. Pass through if the
+      // target is already canonical.
+      if (target.startsWith('mailrow:') || target.startsWith('message:') || type === 'mail') {
+        let resolved = target
+        if (target.startsWith('mailrow:')) {
+          const r = await runLuCli('mail', ['resolve', target])
+          if (r.ok && r.stdout.trim()) {
+            resolved = r.stdout.trim()
+          } else {
+            return { ok: false, error: `无法解析 ${target}：${r.stderr || '邮件可能已删除或 Envelope Index 读不到'}` }
+          }
+        }
+        resolved = sanitizeMessageUrl(resolved)
+        await shell.openExternal(resolved)
         return { ok: true }
       }
       if (type === 'url') {
+        // User double-click → user's own Chrome (system default). Agent
+        // path uses a dedicated IPC (chromeGroup:attach) instead, so the
+        // routing split is explicit per caller.
         await shell.openExternal(target)
         return { ok: true }
+      }
+      // Contact: copy wxid to clipboard + open WeChat. Mac WeChat 4.x has
+      // no documented per-contact deep link; user pastes into search box.
+      if (type === 'contact' || target.startsWith('wxid:')) {
+        const wxid = target.startsWith('wxid:') ? target.slice(5) : target
+        clipboard.writeText(wxid)
+        try {
+          await shell.openExternal('weixin://')
+        } catch {
+          try { execFile('open', ['-a', 'WeChat']) } catch { /* swallow */ }
+        }
+        return { ok: true, wxid_copied: wxid }
       }
       // file / folder / script / obsidian → real filesystem path; let macOS
       // pick the default app (Obsidian is registered for .md so obsidian
@@ -1949,13 +4995,511 @@ function registerIpc(): void {
       'SELECT * FROM agents WHERE folder_path = ? ORDER BY created_at'
     ).all(folderPath) as any[]
     const discovered = discoverClaudeSessions(folderPath)
+    // Back-fill project_id for discovered agents — handleOpenAgent uses
+    // it to render "📁 <parent project> / <alias>" tab labels. The link
+    // lives in the objects table; pick the first project that has this
+    // folder linked (multi-link is rare for ad-hoc cwd-bound agents).
+    const owner = db.prepare(
+      "SELECT project_id FROM objects WHERE type = 'folder' AND target = ? LIMIT 1"
+    ).get(folderPath) as { project_id: number } | undefined
+    const ownerId = owner?.project_id ?? null
     // Filter out discovered ones whose session_id is already in DB
     const dbSessionIds = new Set(dbAgents.map(a => a.session_id))
     const merged = [
       ...dbAgents.map(a => ({ ...a, is_db: true })),
-      ...discovered.filter(d => !dbSessionIds.has(d.session_id)).map(d => ({ ...d, is_db: false })),
+      ...discovered
+        .filter(d => !dbSessionIds.has(d.session_id))
+        .map(d => ({ ...d, is_db: false, project_id: ownerId })),
     ]
     return merged
+  })
+
+  // ── Inbox item bodies (mail/article body fetch used by InboxBodyPreview) ─
+  // The full RSS source-management surface lives in the Python backend's
+  // `lu inbox …` CLI; the Electron app only reads cached item bodies
+  // through these two handlers.
+
+  ipcMain.handle('inbox:getItem', async (_e, itemId: number) => {
+    const row = db.prepare(`
+      SELECT i.*, s.kind AS source_kind, s.name AS source_name
+      FROM inbox_items i JOIN inbox_sources s ON s.id = i.source_id
+      WHERE i.id = ?
+    `).get(itemId) as any
+    if (!row) return null
+    // Email items skip content at sync time to keep syncs fast.
+    // Enrich on-read by calling the mail preview pipeline — first call
+    // per email parses the .emlx (~50-200ms), subsequent calls hit the
+    // mail_preview_cache table (~1ms).
+    if (row.source_kind === 'email' && !row.content_html && !row.content_text && row.url) {
+      try {
+        const preview = await previewMailAsync(row.url)
+        if (preview.kind === 'html') row.content_html = preview.content
+        else if (preview.kind === 'markdown' || preview.kind === 'text') row.content_text = preview.content
+      } catch { /* leave content empty on failure */ }
+    }
+    return row
+  })
+
+  // On-demand article body fetch. RSS feeds like Google DeepMind /
+  // OpenAI sometimes ship items with no description/content (just
+  // title + link), leaving the inbox preview empty. When the user
+  // clicks "📥 抓取原文正文", we fetch the URL, strip noise tags, try
+  // to extract an <article> / <main> region, and persist back into
+  // inbox_items.content_html so subsequent opens are instant.
+  ipcMain.handle('inbox:fetchArticleBody', async (_e, itemId: number) => {
+    const row = db.prepare(
+      'SELECT id, url FROM inbox_items WHERE id = ?'
+    ).get(itemId) as { id: number; url: string | null } | undefined
+    if (!row) return { ok: false, error: 'item not found' }
+    if (!row.url) return { ok: false, error: 'no url to fetch' }
+    if (!/^https?:\/\//i.test(row.url)) {
+      return { ok: false, error: `unsupported scheme: ${row.url.slice(0, 30)}` }
+    }
+
+    let html: string
+    try {
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), 15_000)
+      try {
+        const resp = await fetch(row.url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15',
+            'Accept': 'text/html,application/xhtml+xml',
+          },
+          signal: ctrl.signal,
+        })
+        if (!resp.ok) {
+          return { ok: false, error: `http ${resp.status}` }
+        }
+        html = await resp.text()
+      } finally { clearTimeout(t) }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      return { ok: false, error: `fetch failed: ${msg}` }
+    }
+
+    // Strip noise tags (regex is fine — we don't need a real DOM, just
+    // remove obvious chrome). Then try to isolate the main content
+    // region. If <article> exists, take its innerHTML; else <main>;
+    // else fall back to <body>.
+    const cleaned = html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+      .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+      .replace(/<header[\s\S]*?<\/header>/gi, '')
+      .replace(/<footer[\s\S]*?<\/footer>/gi, '')
+      .replace(/<aside[\s\S]*?<\/aside>/gi, '')
+      .replace(/<!--[\s\S]*?-->/g, '')
+
+    const pickRegion = (tag: string): string | null => {
+      const m = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i').exec(cleaned)
+      return m ? m[1] : null
+    }
+    const region = pickRegion('article') ?? pickRegion('main') ?? (
+      pickRegion('body') ?? cleaned
+    )
+
+    // Store the extracted HTML so subsequent loads skip the fetch.
+    // Cap at 200KB to keep the DB sane — most articles are <50KB after
+    // chrome stripping.
+    const MAX = 200 * 1024
+    const final = region.length > MAX ? region.slice(0, MAX) : region
+    db.prepare(
+      'UPDATE inbox_items SET content_html = ? WHERE id = ?'
+    ).run(final, itemId)
+
+    return { ok: true, content_html: final }
+  })
+
+
+  // Structured mail preview for the inline <MailPreview> component AND
+  // for project-view email items. Cache-first; on miss, parses the emlx
+  // and persists. Returns full mail data including attachments.
+  ipcMain.handle('mail:fullPreview', async (_e, args: {
+    target: string; inboxItemId?: number
+  }) => {
+    return loadMailFullPreview(args.target, args.inboxItemId)
+  })
+
+  // Save attachment #index from email TARGET to the user's Downloads.
+  // Returns {ok, path, name, size} so the UI can show a "saved at <path>"
+  // toast and offer "open in Finder" / "open with default app".
+  ipcMain.handle('mail:saveAttachment', async (_e, args: {
+    target: string; index: number; inboxItemId?: number
+  }) => {
+    let effectiveTarget = args.target
+    // Mirror the resolver fallback so attachment save works for items
+    // whose mailrow:N has been recycled.
+    if (args.target.startsWith('mailrow:')) {
+      const cliArgs = args.inboxItemId
+        ? ['resolve', args.target, '--inbox-item', String(args.inboxItemId)]
+        : ['resolve', args.target]
+      const r = await runLuCli('mail', cliArgs)
+      if (r.ok && r.stdout.trim()) effectiveTarget = r.stdout.trim()
+    }
+    const downloadsDir = join(homedir(), 'Downloads')
+    return new Promise<object>((resolve) => {
+      const cliArgs = [
+        'run', '--directory', LINEUP_ROOT, 'lu', 'mail', 'save-attachment',
+        effectiveTarget, String(args.index), downloadsDir,
+      ]
+      execFile('uv', cliArgs, { cwd: LINEUP_ROOT, timeout: 30000, maxBuffer: 100 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) {
+            resolve({ ok: false, error: stderr?.trim() || err.message })
+            return
+          }
+          try { resolve(JSON.parse(stdout.trim())) }
+          catch { resolve({ ok: false, error: 'parse failed' }) }
+        })
+    })
+  })
+
+
+  ipcMain.handle('agents:listAll', async () => {
+    return await listAllClaudeSessions()
+  })
+
+  ipcMain.handle('agents:readSession', async (
+    _e, args: { folderPath: string; sessionId: string }
+  ) => {
+    return await getSessionData(args.folderPath, args.sessionId)
+  })
+
+  ipcMain.handle('agents:summarizeSession', async (
+    _e, args: { folderPath: string; sessionId: string; force?: boolean }
+  ) => {
+    return await summarizeSession(args.folderPath, args.sessionId, { force: args.force })
+  })
+
+  // Read-only: returns the cached summary for a session or null. Safe to
+  // call on tab entry — never hits the API.
+  ipcMain.handle('agents:getCachedSummary', (_e, args: { sessionId: string }) => {
+    const db = getDb()
+    const row = db.prepare(
+      'SELECT summary_md, input_tokens, output_tokens, cost_usd, model, jsonl_mtime_ms FROM session_summaries WHERE session_id = ?'
+    ).get(args.sessionId) as any
+    return row ?? null
+  })
+
+  ipcMain.handle('agents:buildFolderTree', async (_e, args: { folderPath: string }) => {
+    return await buildFolderTree(args.folderPath)
+  })
+
+  ipcMain.handle('agents:getCachedFolderTree', (_e, args: { folderPath: string }) => {
+    return getCachedFolderTree(args.folderPath)
+  })
+
+  // Auto-summarize a batch of time buckets (day or 4h slot) via MiMo.
+  // Returns one entry per requested bucket, with summary or error.
+  ipcMain.handle('agents:summarizeBuckets', async (_e, args: {
+    sessionId: string
+    folderPath: string
+    buckets: Array<{ date: string; slot_index: number; event_indices: number[] }>
+  }) => {
+    return await summarizeBuckets(args.sessionId, args.folderPath, args.buckets)
+  })
+
+  ipcMain.handle('agents:renameSession', (_e, args: {
+    sessionId: string; title: string; source?: 'manual' | 'mimo'
+  }) => {
+    const db = getDb()
+    const title = args.title.trim()
+    if (!title) {
+      // Empty → delete the override, fall back to auto-derived name.
+      db.prepare('DELETE FROM session_titles WHERE session_id = ?').run(args.sessionId)
+      return { ok: true, cleared: true }
+    }
+    db.prepare(`
+      INSERT INTO session_titles (session_id, title, source, updated_at)
+      VALUES (?, ?, ?, datetime('now'))
+      ON CONFLICT(session_id) DO UPDATE SET
+        title = excluded.title,
+        source = excluded.source,
+        updated_at = excluded.updated_at
+    `).run(args.sessionId, title, args.source ?? 'manual')
+    return { ok: true, cleared: false }
+  })
+
+  ipcMain.handle('agents:generateSessionTitle', async (_e, args: {
+    sessionId: string; folderPath: string
+  }) => {
+    const r = await generateSessionTitle(args.folderPath, args.sessionId)
+    if (!r.ok) return r
+    const db = getDb()
+    db.prepare(`
+      INSERT INTO session_titles (session_id, title, source, updated_at)
+      VALUES (?, ?, 'mimo', datetime('now'))
+      ON CONFLICT(session_id) DO UPDATE SET
+        title = excluded.title, source = 'mimo', updated_at = datetime('now')
+    `).run(args.sessionId, r.title)
+    return { ok: true, title: r.title }
+  })
+
+  /**
+   * Background auto-titling: fire MiMo for each session that doesn't have
+   * a fresh auto-title. Skips manual titles (never overwrites) and skips
+   * auto-titles where session activity (last_ts) hasn't changed since the
+   * last generation. Concurrency-limited so we don't hammer the endpoint.
+   */
+  ipcMain.handle('agents:autoTitleSessions', async (
+    _e, sessions: Array<{ sessionId: string; folderPath: string; lastTs: string }>,
+  ) => {
+    const db = getDb()
+    type Result = { sessionId: string; title?: string; skipped?: string; error?: string }
+    const results: Result[] = []
+    const CONCURRENCY = 3
+    let i = 0
+    async function worker() {
+      while (i < sessions.length) {
+        const s = sessions[i++]
+        if (!s.folderPath) { results.push({ sessionId: s.sessionId, skipped: 'no folder' }); continue }
+        const row = db.prepare(
+          'SELECT source, last_ts FROM session_titles WHERE session_id = ?'
+        ).get(s.sessionId) as { source: string; last_ts: string } | undefined
+        // User-set manual titles are never overwritten by auto.
+        if (row?.source === 'manual') { results.push({ sessionId: s.sessionId, skipped: 'manual' }); continue }
+        // Already auto-titled for this exact activity state — reuse.
+        if (row?.source === 'mimo-auto' && row.last_ts === s.lastTs) {
+          results.push({ sessionId: s.sessionId, skipped: 'cached' })
+          continue
+        }
+        const r = await generateSessionTitle(s.folderPath, s.sessionId)
+        if (!r.ok) {
+          results.push({ sessionId: s.sessionId, error: r.error })
+          continue
+        }
+        db.prepare(`
+          INSERT INTO session_titles (session_id, title, source, last_ts, updated_at)
+          VALUES (?, ?, 'mimo-auto', ?, datetime('now'))
+          ON CONFLICT(session_id) DO UPDATE SET
+            title = excluded.title,
+            source = 'mimo-auto',
+            last_ts = excluded.last_ts,
+            updated_at = datetime('now')
+        `).run(s.sessionId, r.title, s.lastTs)
+        results.push({ sessionId: s.sessionId, title: r.title })
+      }
+    }
+    await Promise.all(Array(Math.min(CONCURRENCY, sessions.length)).fill(0).map(worker))
+    return results
+  })
+
+  ipcMain.handle('shell:openExternalTerminalWithCommand', async (
+    _e, args: { cwd: string; command: string }
+  ) => {
+    return await openExternalTerminalWithCommand(args.cwd, args.command)
+  })
+
+  // Dev-mode self-restart: close the Terminal window we opened on the
+  // previous restart (if any), kill orphan electron-vite processes
+  // from the lineup frontend dir, then open a fresh Terminal running
+  // `npm run dev` and quit. We track our spawned window's id in a
+  // tiny JSON file under ~/.lineup/ so the next ↻ press can identify
+  // and close it — without that, every restart accumulated a new
+  // Terminal window forever.
+  //
+  // The user's FIRST `npm run dev` terminal (started by hand before
+  // they ever hit ↻) isn't tracked, so on the first restart we leave
+  // it alone — but pkill catches its electron-vite process, returning
+  // its shell to a prompt; user can close that window manually once.
+  //
+  // Sleep 2s in the new shell lets the current vite/electron release
+  // ports before the new instance binds them.
+  ipcMain.handle('dev:restart', async () => {
+    if (app.isPackaged) {
+      return { ok: false, error: 'restart only supported in dev mode' }
+    }
+    const frontendDir = join(LINEUP_ROOT, 'frontend')
+    const esc = (s: string) => s.replace(/'/g, "'\\''")
+
+    // Step 1: try to close the Terminal window we opened last time.
+    // State file: ~/.lineup/dev-restart-state.json holds { windowId: <int> }.
+    const stateFile = join(LINEUP_DATA_DIR, 'dev-restart-state.json')
+    let prevWindowId: number | null = null
+    try {
+      const raw = readFileSync(stateFile, 'utf8')
+      const obj = JSON.parse(raw) as { windowId?: number }
+      if (typeof obj.windowId === 'number') prevWindowId = obj.windowId
+    } catch { /* first restart, or file missing — fine */ }
+    if (prevWindowId !== null) {
+      const closeScript = `
+tell application "Terminal"
+    try
+        close (every window whose id is ${prevWindowId}) saving no
+    end try
+end tell
+`
+      await new Promise<void>(resolve => {
+        execFile('osascript', ['-e', closeScript], () => resolve())
+      })
+    }
+
+    // Step 2: kill orphan electron-vite processes from this frontend
+    // dir. Catches: the user's original-terminal electron-vite (if
+    // they started by hand), plus any zombie vites we missed in past
+    // restarts. -f matches the full command line so we only target
+    // electron-vite, not unrelated node procs.
+    await new Promise<void>(resolve => {
+      execFile('pkill', ['-f', 'electron-vite.*dev'], () => resolve())
+    })
+
+    // Step 3: open new Terminal, capture window id, save to state.
+    // The osascript `do script` returns the tab; `id of window 1`
+    // gives us a stable window handle for the next restart to close.
+    const openScript = `
+tell application "Terminal"
+    reopen
+    activate
+    do script "cd '${esc(frontendDir)}' && sleep 2 && npm run dev"
+    delay 0.1
+    return id of front window
+end tell
+`
+    const newWindowId = await new Promise<number | null>(resolve => {
+      execFile('osascript', ['-e', openScript], (err, stdout) => {
+        if (err) { resolve(null); return }
+        const id = parseInt((stdout || '').trim(), 10)
+        resolve(Number.isFinite(id) ? id : null)
+      })
+    })
+    if (newWindowId === null) {
+      return { ok: false, error: 'failed to spawn new terminal' }
+    }
+    try {
+      mkdirSync(dirname(stateFile), { recursive: true })
+      writeFileSync(stateFile, JSON.stringify({ windowId: newWindowId }), 'utf8')
+    } catch { /* state-file write fails → next restart can't close us, livable */ }
+
+    // Best-effort focus the new window (System Events frontmost call).
+    execFile('osascript', ['-e',
+      'tell application "System Events" to set frontmost of ' +
+      '(first process whose name is "Terminal") to true'], () => { /* ignore */ })
+
+    // Step 4: quit current electron after the IPC reply makes it back.
+    setTimeout(() => app.quit(), 300)
+    return { ok: true }
+  })
+
+  // Resolve a cwd that lets `claude --resume <sessionId>` actually find
+  // the jsonl. The caller-supplied folder_path (read from the jsonl's
+  // `cwd` field) is often WRONG: claude stores the jsonl in the encoded
+  // dir of whichever cwd the session was originally launched in, but the
+  // per-line `cwd` field can shift later (e.g. lineup re-mounts the same
+  // session in a different tab with a different cwd, or auto-compact
+  // preserves the parent's storage location while the user has cd'd
+  // elsewhere). Result: AgentsView shows folder X, but resume from X
+  // fails because the jsonl is actually under encode(Y).
+  //
+  // We find the jsonl's true location, derive a cwd that encodes back to
+  // the same dir, and return it. For ASCII paths the encoding is just
+  // s/[^A-Za-z0-9]/-/g so it inverts cleanly. For non-ASCII (Chinese)
+  // paths we scan sibling jsonls and pick the first one whose cwd
+  // re-encodes to the same dir AND exists on disk.
+  ipcMain.handle('agents:resolveResumeCwd', (_e, sessionId: string) => {
+    const jsonlPath = findSessionJsonl(sessionId)
+    if (!jsonlPath) return { ok: false, error: 'session jsonl not found' }
+    const encodedDir = jsonlPath.split('/').slice(-2, -1)[0]
+
+    // Strategy 1: ASCII inversion. -A-B-C → /A/B/C.
+    const candidate = '/' + encodedDir.split('-').filter(Boolean).join('/')
+    if (existsSync(candidate) && encodeCwdForClaude(candidate) === encodedDir) {
+      return { ok: true, cwd: candidate, jsonl: jsonlPath }
+    }
+
+    // Strategy 2: scan siblings for a cwd that round-trips.
+    try {
+      const dirPath = join(homedir(), '.claude', 'projects', encodedDir)
+      const files = readdirSync(dirPath).filter(f => f.endsWith('.jsonl'))
+      for (const f of files) {
+        try {
+          const head = readFileSync(join(dirPath, f), 'utf8').slice(0, 8192)
+          const firstLine = head.split('\n').find(l => l.trim().length > 0)
+          if (!firstLine) continue
+          const obj = JSON.parse(firstLine)
+          if (typeof obj.cwd === 'string'
+              && existsSync(obj.cwd)
+              && encodeCwdForClaude(obj.cwd) === encodedDir) {
+            return { ok: true, cwd: obj.cwd, jsonl: jsonlPath }
+          }
+        } catch { /* skip bad jsonls */ }
+      }
+    } catch { /* ignore */ }
+
+    return { ok: false, error: `无法反推目录 ${encodedDir}（路径含非 ASCII 字符且无可用兄弟会话）` }
+  })
+
+  // Estimate the total cost of summarizing every known session. Walks the
+  // cache table to know what's already done (free), builds a skeleton for
+  // each un-cached session and uses Anthropic's token counter to get a
+  // faithful input-token count WITHOUT actually calling the model. Output
+  // is estimated at a fixed 600 tokens / summary.
+  ipcMain.handle('agents:estimateBulkCost', async () => {
+    const all = await listAllClaudeSessions()
+    const db = getDb()
+    const cached = new Set(
+      (db.prepare('SELECT session_id FROM session_summaries').all() as any[])
+        .map(r => r.session_id)
+    )
+    let total_input_chars = 0
+    let sessions_needing = 0
+    let sessions_cached = 0
+    const perSession: Array<{
+      session_id: string
+      folder_path: string
+      skeleton_chars: number
+      cached: boolean
+    }> = []
+    for (const a of all) {
+      if (!a.folder_path) continue
+      if (cached.has(a.session_id)) {
+        sessions_cached++
+        perSession.push({
+          session_id: a.session_id,
+          folder_path: a.folder_path,
+          skeleton_chars: 0,
+          cached: true,
+        })
+        continue
+      }
+      sessions_needing++
+      const jsonlPath = findJsonlPath(a.folder_path, a.session_id)
+      if (!jsonlPath) continue
+      try {
+        const data = await parseSessionFull(jsonlPath)
+        const sk = buildSkeleton(data)
+        total_input_chars += sk.length
+        perSession.push({
+          session_id: a.session_id,
+          folder_path: a.folder_path,
+          skeleton_chars: sk.length,
+          cached: false,
+        })
+      } catch { /* skip */ }
+    }
+    // Rough conversion: ~3.5 chars/token for CJK-mixed text (English is
+    // closer to 4, Chinese denser at ~2-3; averaging). Output fixed at
+    // 600 tokens per summary — that's roughly what our prompt produces.
+    const CHARS_PER_TOKEN = 3.5
+    const est_input_tokens = Math.round(total_input_chars / CHARS_PER_TOKEN)
+    const est_output_tokens = sessions_needing * 600
+    const primary = MODEL_FALLBACKS[0]
+    const est_cost_usd =
+      (est_input_tokens * primary.input_per_mtok) / 1e6 +
+      (est_output_tokens * primary.output_per_mtok) / 1e6
+    return {
+      total_sessions: all.length,
+      sessions_cached,
+      sessions_needing,
+      est_input_tokens,
+      est_output_tokens,
+      est_cost_usd,
+      model: primary.slug,
+      input_per_mtok: primary.input_per_mtok,
+      output_per_mtok: primary.output_per_mtok,
+      per_session: perSession,
+    }
   })
 
   ipcMain.handle('agents:create', (_e, args: {
@@ -1982,12 +5526,162 @@ function registerIpc(): void {
     db.prepare('DELETE FROM agents WHERE id = ?').run(agentId)
   })
 
+  // Compact metadata for ALL active projects (any type), including the
+  // filesystem folder the project/task resolves to. Used by the inbox
+  // proposal UI to render "调用 <project-name> (<folder>) 的 agent".
+  // Walks parents to find the nearest ancestor with a linked folder,
+  // mirroring the Python `_get_project_folder()` helper.
+  // Global search across projects + objects. Plain LIKE queries — the
+  // combined row count is small (<2k for this user), so a wildcard scan
+  // with name/description matching beats the complexity of an FTS5
+  // virtual table + sync triggers. Returns two parallel lists capped at
+  // 30 each so the modal stays readable.
+  ipcMain.handle('search:query', (_e, q: string) => {
+    const trimmed = (q || '').trim()
+    if (!trimmed) return { projects: [], objects: [] }
+    // Escape SQLite LIKE wildcards so user-typed underscores etc. match
+    // literally instead of as regex-ish patterns.
+    const escaped = trimmed.replace(/[\\%_]/g, m => '\\' + m)
+    const needle = `%${escaped}%`
+    const projects = db.prepare(`
+      SELECT id, name, description, type, archived
+      FROM projects
+      WHERE (name LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\')
+        AND (archived IS NULL OR archived = 0)
+      ORDER BY
+        CASE WHEN name LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,  -- name hits first
+        LENGTH(name) ASC,                                       -- shorter = closer match
+        name
+      LIMIT 30
+    `).all(needle, needle, needle)
+    const objects = db.prepare(`
+      SELECT o.id, o.name, o.target, o.type, o.project_id,
+             p.name AS project_name
+      FROM objects o JOIN projects p ON p.id = o.project_id
+      WHERE o.name LIKE ? ESCAPE '\\' OR o.target LIKE ? ESCAPE '\\'
+      ORDER BY
+        CASE WHEN o.name LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
+        LENGTH(o.name) ASC,
+        o.name
+      LIMIT 30
+    `).all(needle, needle, needle)
+    return { projects, objects }
+  })
+
+  // Reverse-map a cwd to the project whose virtual dir is exactly
+  // that path. Used by handleOpenAgent on the renderer to detect when
+  // a "folder agent" picked from AgentsView is actually a project
+  // main agent (cwd === ~/.lineup/projects/.../<projectName>) — those
+  // tabs should get a 🏠 prefix + the project:N tab id so they share
+  // state with the project's main-agent tab elsewhere in the app.
+  //
+  // Returns null if cwd doesn't correspond to any project's virtual
+  // dir. Disambiguates same-named projects under different parents by
+  // computing each candidate's virtual path via virtualProjectDirById
+  // and matching the FULL path, not just the basename.
+  ipcMain.handle('projects:findByVirtualPath', (_e, cwd: string) => {
+    if (!cwd) return null
+    if (!cwd.startsWith(VIRTUAL_PROJECTS_ROOT + '/')) return null
+    const basename = cwd.split('/').filter(Boolean).pop() || ''
+    if (!basename) return null
+    // Every project whose name slug equals basename is a candidate.
+    const candidates = db.prepare(
+      'SELECT id, name FROM projects WHERE name = ?'
+    ).all(basename) as Array<{ id: number; name: string }>
+    for (const c of candidates) {
+      if (virtualProjectDirById(c.id, c.name) === cwd) {
+        return { id: c.id, name: c.name }
+      }
+    }
+    return null
+  })
+
+  ipcMain.handle('projects:metaForLookup', () => {
+    type Row = { id: number; name: string; type: string; own_folder: string | null }
+    const rows = db.prepare(`
+      SELECT p.id, p.name, p.type,
+             (SELECT o.target FROM objects o
+              WHERE o.project_id = p.id AND o.type = 'folder'
+              ORDER BY o.id LIMIT 1) AS own_folder
+      FROM projects p
+      WHERE (p.archived IS NULL OR p.archived = 0)
+    `).all() as Row[]
+    const parentOf = new Map<number, number>()
+    for (const r of db.prepare(
+      'SELECT project_id, parent_id FROM project_parents'
+    ).all() as Array<{ project_id: number; parent_id: number }>) {
+      parentOf.set(r.project_id, r.parent_id)
+    }
+    const byId = new Map<number, Row>(rows.map(r => [r.id, r]))
+    const resolveFolder = (pid: number): string | null => {
+      let cur = pid
+      for (let i = 0; i < 10; i++) {
+        const r = byId.get(cur)
+        if (!r) return null
+        if (r.own_folder) return r.own_folder
+        const parent = parentOf.get(cur)
+        if (!parent) return null
+        cur = parent
+      }
+      return null
+    }
+    return rows.map(r => ({
+      id: r.id, name: r.name, type: r.type,
+      folder: resolveFolder(r.id),
+    }))
+  })
+
+  // Zotero-anchored agents. folder_path on these rows points at the item's
+  // PDF storage folder (from ~/Zotero/storage/<attachment-key>/) when one
+  // exists, else at a lineup scratch dir ~/.lineup/zotero/<item-key>/.
+  // That way `claude` can Read the PDF directly when you start a chat.
+  ipcMain.handle('agents:listForZotero', (_e, zoteroKey: string) => {
+    return db.prepare(
+      'SELECT * FROM agents WHERE zotero_key = ? ORDER BY created_at'
+    ).all(zoteroKey)
+  })
+
+  ipcMain.handle('agents:createForZotero', async (_e, args: {
+    zoteroKey: string
+    name: string
+    sessionId?: string
+    systemPrompt?: string
+  }) => {
+    // Resolve storage folder via the Python zotero plugin — single source
+    // of truth so CLI and UI behave identically.
+    const r = await new Promise<{ ok: boolean; stdout: string; stderr: string }>((resolve) => {
+      execFile('uv', ['run', '--directory', LINEUP_ROOT, 'lu', 'zotero', 'resolve', args.zoteroKey],
+        { cwd: LINEUP_ROOT, maxBuffer: 1_000_000, timeout: 10_000 },
+        (err, stdout, stderr) => {
+          if (err) resolve({ ok: false, stdout: String(stdout), stderr: err.message + '\n' + String(stderr) })
+          else resolve({ ok: true, stdout: String(stdout), stderr: String(stderr) })
+        },
+      )
+    })
+    if (!r.ok || !r.stdout.trim()) {
+      return { ok: false, error: `无法解析 zotero 条目 ${args.zoteroKey}: ${r.stderr}` }
+    }
+    const folder = r.stdout.trim()
+    // session_id stays empty if no pre-existing claude session for this
+    // folder — the zshrc wrapper creates + persists one on first run.
+    const sessionId = args.sessionId ?? ''
+    const info = db.prepare(
+      'INSERT INTO agents (project_id, folder_path, name, session_id, system_prompt, zotero_key) ' +
+      'VALUES (NULL, ?, ?, ?, ?, ?)'
+    ).run(folder, args.name, sessionId, args.systemPrompt ?? '', args.zoteroKey)
+    return { ok: true, agentId: info.lastInsertRowid, folder }
+  })
+
   ipcMain.handle('search:obsidian', async (_e, query: string) => {
     return runSearchCli('obsidian', query)
   })
 
   ipcMain.handle('search:trilium', async (_e, query: string) => {
     return runSearchCli('trilium', query)
+  })
+
+  ipcMain.handle('search:mail', async (_e, query: string) => {
+    return runSearchCli('mail', query)
   })
 
   ipcMain.handle('search:zotero', async (_e, query: string) => {
@@ -2011,6 +5705,10 @@ function registerIpc(): void {
       // Zotero items need Python (immutable=1 URI) to bypass the write lock.
       if (args.type === 'zotero' && args.target.startsWith('zotero://select/library/items/')) {
         return await previewZoteroItemAsync(args.target)
+      }
+      // Mail: shell out to `lu mail preview` which parses the .emlx file.
+      if (args.type === 'mail') {
+        return await previewMailAsync(args.target)
       }
       return loadPreview(args.type, args.target)
     } catch (e: any) {
@@ -2065,6 +5763,142 @@ function registerIpc(): void {
   })
 }
 
+/**
+ * Scheduled AI maintenance loop — runs on startup + hourly afterwards.
+ * Currently covers:
+ *   1) Auto-titling agent sessions (MiMo) — picks up new sessions and
+ *      re-titles any whose last_ts moved since the last auto-title.
+ *   2) Time-bucket summaries — pre-generates day-level summaries for
+ *      active sessions so the inspector opens instantly.
+ * Both are best-effort: errors are logged to stdout and don't block the
+ * next tick. No UI refresh needed — DB mutations trigger WAL watcher.
+ */
+/**
+ * Pre-warm mail_preview_cache for every email inbox_item that doesn't
+ * have a cached body yet. Runs at startup + after each inbox sync.
+ *
+ * Why: clicking 🔗 原文 (or selecting an email in a project) was slow
+ * because the preview path shells out to `lu mail preview` which can
+ * rglob the entire ~/Library/Mail tree for `message://<MID>` targets.
+ * Pre-warming during sync (where we already located the emlx) means the
+ * UI hits the SQLite cache with sub-millisecond latency.
+ *
+ * Concurrency limited so we don't fork 200 uv processes at once. Skips
+ * items already in cache (idempotent — safe to call repeatedly).
+ */
+/**
+ * Module-level uv-CLI helper. Wraps `uv run --directory <LINEUP_ROOT>
+ * lu <group> ...` so any callsite (IPC handler, scheduled task, etc.)
+ * can shell to the Python CLI without rebuilding the spawn config.
+ */
+function runLuCli(
+  group: 'mail',
+  args: string[],
+  stdin?: string,
+  timeoutMs = 120_000,
+): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = execFile(
+      'uv', ['run', '--directory', LINEUP_ROOT, 'lu', group, ...args],
+      { cwd: LINEUP_ROOT, maxBuffer: 20 * 1024 * 1024, timeout: timeoutMs },
+      (err, stdout, stderr) => {
+        if (err) resolve({ ok: false, stdout: String(stdout), stderr: (err.message + '\n' + String(stderr)).trim() })
+        else resolve({ ok: true, stdout: String(stdout), stderr: String(stderr) })
+      },
+    )
+    if (stdin != null && child.stdin) {
+      child.stdin.write(stdin)
+      child.stdin.end()
+    }
+  })
+}
+
+let _mailPrewarmInFlight = false
+async function prewarmMailCache(): Promise<{ scanned: number; warmed: number }> {
+  if (_mailPrewarmInFlight) return { scanned: 0, warmed: 0 }
+  _mailPrewarmInFlight = true
+  try {
+    const db = getDb()
+    const rows = db.prepare(`
+      SELECT i.id, i.url
+      FROM inbox_items i
+      JOIN inbox_sources s ON s.id = i.source_id
+      LEFT JOIN mail_preview_cache c ON c.target = i.url
+      WHERE s.kind = 'email'
+        AND i.url IS NOT NULL
+        AND c.target IS NULL
+      ORDER BY i.id DESC
+      LIMIT 500
+    `).all() as { id: number; url: string }[]
+
+    if (rows.length === 0) return { scanned: 0, warmed: 0 }
+    console.log(`[mail-prewarm] ${rows.length} uncached email(s) → warming…`)
+
+    let warmed = 0
+    const CONCURRENCY = 4
+    let idx = 0
+    async function worker() {
+      while (idx < rows.length) {
+        const row = rows[idx++]
+        try {
+          const r = await loadMailFullPreview(row.url, row.id)
+          if (r.ok) warmed++
+        } catch { /* per-item failures are fine */ }
+      }
+    }
+    await Promise.all(Array(Math.min(CONCURRENCY, rows.length)).fill(0).map(worker))
+    console.log(`[mail-prewarm] warmed ${warmed}/${rows.length}`)
+    return { scanned: rows.length, warmed }
+  } catch (e: any) {
+    console.log(`[mail-prewarm] error: ${e?.message ?? e}`)
+    return { scanned: 0, warmed: 0 }
+  } finally {
+    _mailPrewarmInFlight = false
+  }
+}
+
+async function runScheduledAITasks() {
+  const startedAt = new Date().toISOString()
+  console.log(`[ai-cron] tick ${startedAt}`)
+  try {
+    const sessions = await listAllClaudeSessions()
+    const db = getDb()
+
+    // ── 1. Auto-title stale sessions (inline-duplicated from
+    //    agents:autoTitleSessions since we're in main-process context
+    //    and can't IPC-invoke ourselves).
+    const CONCURRENCY = 2
+    let idx = 0
+    let titled = 0, titleSkipped = 0, titleErr = 0
+    async function worker() {
+      while (idx < sessions.length) {
+        const s = sessions[idx++]
+        if (!s.folderPath) { titleSkipped++; continue }
+        const row = db.prepare(
+          'SELECT source, last_ts FROM session_titles WHERE session_id = ?'
+        ).get(s.sessionId) as { source: string; last_ts: string } | undefined
+        if (row?.source === 'manual') { titleSkipped++; continue }
+        if (row?.source === 'mimo-auto' && row.last_ts === s.lastTs) { titleSkipped++; continue }
+        const r = await generateSessionTitle(s.folderPath, s.sessionId)
+        if (!r.ok) { titleErr++; continue }
+        db.prepare(`
+          INSERT INTO session_titles (session_id, title, source, last_ts, updated_at)
+          VALUES (?, ?, 'mimo-auto', ?, datetime('now'))
+          ON CONFLICT(session_id) DO UPDATE SET
+            title = excluded.title, source = 'mimo-auto',
+            last_ts = excluded.last_ts, updated_at = datetime('now')
+        `).run(s.sessionId, r.title, s.lastTs)
+        titled++
+      }
+    }
+    await Promise.all(Array(Math.min(CONCURRENCY, sessions.length)).fill(0).map(worker))
+    console.log(`[ai-cron] titles: ${titled} new, ${titleSkipped} skipped, ${titleErr} err (${sessions.length} total sessions)`)
+  } catch (e: any) {
+    console.log(`[ai-cron] error: ${e?.message ?? e}`)
+  }
+}
+
+
 // ── App lifecycle ──────────────────────────────────────────────────────
 
 app.whenReady().then(() => {
@@ -2074,13 +5908,16 @@ app.whenReady().then(() => {
   })
   registerIpc()
   registerPtyIpc()
+  // One-shot cleanup of pre-Plan-C flat virtual dirs. Idempotent so it's
+  // cheap to run on every boot — does nothing once the migration is done.
+  try { migrateFlatVirtualDirs() } catch (e) { console.warn('[migrate] failed:', e) }
   createWindow()
 
   // Watch ~/.lineup/lineup.db-wal for changes so the UI can refresh when
   // an MCP tool (or any other process) mutates the DB behind our back.
   // WAL file changes on every write; main DB file only changes on
   // checkpoints, so WAL is the signal we want.
-  const walPath = WAL_PATH
+  const walPath = join(LINEUP_DATA_DIR, 'lineup.db-wal')
   let lastFireAt = 0
   watchFile(walPath, { interval: 800 }, (curr, prev) => {
     if (curr.mtimeMs === prev.mtimeMs) return
@@ -2098,6 +5935,26 @@ app.whenReady().then(() => {
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  })
+
+  // Scheduled AI maintenance: every hour, auto-title any sessions that are
+  // missing a fresh title. Runs in the main process so we can shell
+  // MiMo off-UI-thread without needing the renderer open.
+  runScheduledAITasks()   // once on startup
+  setInterval(runScheduledAITasks, 60 * 60 * 1000)  // hourly
+
+  // Mail body cache pre-warm — runs once a minute after startup (idempotent;
+  // skips items already cached). Keeps preview clicks instant.
+  setTimeout(() => { void prewarmMailCache() }, 60 * 1000)
+  setInterval(() => { void prewarmMailCache() }, 15 * 60 * 1000)  // every 15 min
+
+  // Memory monitor — samples every 30s into ~/.lineup/memory_log.jsonl.
+  // Pty pid getter pulls from the live `ptys` map so stopped sessions
+  // drop out automatically.
+  startMemoryMonitor(() => {
+    const out: number[] = []
+    for (const p of ptys.values()) if (p.pid) out.push(p.pid)
+    return out
   })
 })
 

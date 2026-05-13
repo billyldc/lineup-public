@@ -4,13 +4,39 @@ import { ContextMenu, type MenuEntry } from './ContextMenu'
 import { InputDialog } from './InputDialog'
 import { BrowseDialog } from './BrowseDialog'
 import { ConfirmDialog } from './ConfirmDialog'
+import { CopyToPicker } from './CopyToPicker'
 import { filesystemPathForObject } from '../lib/utils'
 import { PROJECT_COLORS } from './Inspector'
 import { setObjectDragData, setProjectDragData, handleObjectDragOver, performDrop } from '../lib/drag'
 
 const typeLabels: Record<string, string> = {
   file: '文件', folder: '文件夹', url: '链接', zotero: '文献',
-  trilium: '笔记', obsidian: '笔记', script: '脚本',
+  trilium: '笔记', obsidian: '笔记', script: '脚本', mail: '邮件',
+}
+
+function weekdayCN(dateStr: string): string {
+  const d = new Date(dateStr.slice(0, 10))
+  if (Number.isNaN(d.getTime())) return ''
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()]
+}
+
+function addDaysToDateStr(dateStr: string, days: number): string {
+  const d = new Date(dateStr.slice(0, 10))
+  d.setDate(d.getDate() + days)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function todayStr(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function fmtMD(dateStr: string): string {
+  const [, m, d] = dateStr.slice(0, 10).split('-')
+  return `${m}/${d}`
 }
 
 interface ColumnProps {
@@ -36,12 +62,16 @@ type DialogState =
   | { kind: 'text-object-name'; type: RegisteredType }
   | { kind: 'text-object-target'; type: RegisteredType; name: string }
   | { kind: 'fs-object-name'; type: RegisteredType; target: string }
-  | { kind: 'browse'; type: RegisteredType; source: 'obsidian' | 'trilium' | 'zotero' }
+  | { kind: 'browse'; type: RegisteredType; source: 'obsidian' | 'trilium' | 'zotero' | 'mail' }
   | { kind: 'confirm-delete-project'; project: Project; parentCount: number }
   | { kind: 'confirm-delete-object'; object: ObjectRow }
+  | { kind: 'confirm-bulk-delete-objects'; ids: number[] }
   | { kind: 'rename-project'; project: Project }
   | { kind: 'rename-object'; object: ObjectRow }
   | { kind: 'relink-object'; object: ObjectRow }
+  | { kind: 'insert-step-relative'; neighbor: Project; position: 'before' | 'after' }
+  | { kind: 'copy-to-project'; project: Project }
+  | { kind: 'copy-to-object'; object: ObjectRow }
 
 const DEFAULT_COL_WIDTH = 288  // matches old w-72
 const MIN_COL_WIDTH = 200
@@ -65,6 +95,9 @@ export function Column({
   refreshSignal = 0,
 }: ColumnProps) {
   const [selectedObjectId, setSelectedObjectId] = useState<number | null>(null)
+  // Ctrl-click multi-selection for object rows. Primarily for bulk delete.
+  // Right-click on a selected item → menu applies to the whole selection.
+  const [multiSelObjIds, setMultiSelObjIds] = useState<Set<number>>(new Set())
   const [project, setProject] = useState<Project | null>(null)
   const [subProjects, setSubProjects] = useState<Project[]>([])
   const [objects, setObjects] = useState<ObjectRow[]>([])
@@ -191,6 +224,12 @@ export function Column({
   function handleObjectRowContextMenu(e: React.MouseEvent, o: ObjectRow) {
     e.preventDefault()
     e.stopPropagation()
+    // If right-clicking an object NOT in the multi-selection, drop the
+    // selection and act on just this item. If it IS in the selection,
+    // the menu applies to the whole selection.
+    if (!multiSelObjIds.has(o.id)) {
+      setMultiSelObjIds(new Set())
+    }
     setMenuTarget({ kind: 'object', object: o })
     setMenu({ x: e.clientX, y: e.clientY })
   }
@@ -236,6 +275,8 @@ export function Column({
       setDialog({ kind: 'browse', type: t, source: 'trilium' })
     } else if (t.name === 'zotero') {
       setDialog({ kind: 'browse', type: t, source: 'zotero' })
+    } else if (t.name === 'mail') {
+      setDialog({ kind: 'browse', type: t, source: 'mail' })
     } else {
       // url / script — text input
       setDialog({ kind: 'text-object-name', type: t })
@@ -258,6 +299,15 @@ export function Column({
   async function handleDeleteObject(o: ObjectRow) {
     await window.lineup.removeObject(o.id)
     setDialog(null)
+    await load()
+  }
+
+  async function handleBulkDeleteObjects(ids: number[]) {
+    for (const id of ids) {
+      await window.lineup.removeObject(id)
+    }
+    setDialog(null)
+    setMultiSelObjIds(new Set())
     await load()
   }
 
@@ -297,14 +347,14 @@ export function Column({
             label: '📁 插入子项目',
             onClick: () => setDialog({ kind: 'new-project' }),
           },
-          { separator: true },
+          { separator: true as const },
         ] : []),
         ...(parentIsTask ? [
           {
             label: '☑ 插入 step',
             onClick: () => setDialog({ kind: 'new-step' }),
           },
-          { separator: true },
+          { separator: true as const },
         ] : []),
         ...registeredTypes.map(t => ({
           label: `📄 插入${t.label}`,
@@ -316,21 +366,54 @@ export function Column({
   const rowMenuItems: MenuEntry[] = (() => {
     if (!menuTarget) return []
     if (menuTarget.kind === 'project') {
-      return [
+      const items: MenuEntry[] = [
         {
           label: '✏️ 重命名',
           onClick: () => setDialog({ kind: 'rename-project', project: menuTarget.project }),
         },
+      ]
+      // Step-only actions: insert a sibling step before or after this one.
+      if (menuTarget.project.type === 'step') {
+        items.push({ separator: true })
+        items.push({
+          label: '⬆ 在该步骤前插入步骤',
+          onClick: () => setDialog({ kind: 'insert-step-relative', neighbor: menuTarget.project, position: 'before' }),
+        })
+        items.push({
+          label: '⬇ 在该步骤后插入步骤',
+          onClick: () => setDialog({ kind: 'insert-step-relative', neighbor: menuTarget.project, position: 'after' }),
+        })
+      }
+      items.push({ separator: true })
+      items.push({
+        label: '📎 引用到…',
+        onClick: () => setDialog({ kind: 'copy-to-project', project: menuTarget.project }),
+      })
+      items.push({ separator: true })
+      items.push({
+        label: '🗑 删除',
+        onClick: async () => {
+          const cnt = await window.lineup.getProjectParentCount(menuTarget.project.id)
+          setDialog({ kind: 'confirm-delete-project', project: menuTarget.project, parentCount: cnt })
+        },
+      })
+      return items
+    }
+    // Multi-selection mode: only show ops that make sense for a batch.
+    // Right now that's just "bulk delete" — the intersection of all per-item ops.
+    if (multiSelObjIds.size > 1 && multiSelObjIds.has(menuTarget.object.id)) {
+      return [
         {
-          label: '🗑 删除',
-          onClick: async () => {
-            const cnt = await window.lineup.getProjectParentCount(menuTarget.project.id)
-            setDialog({ kind: 'confirm-delete-project', project: menuTarget.project, parentCount: cnt })
-          },
+          label: `🗑 删除 ${multiSelObjIds.size} 个对象`,
+          onClick: () => setDialog({
+            kind: 'confirm-bulk-delete-objects',
+            ids: Array.from(multiSelObjIds),
+          }),
         },
       ]
     }
-    // Object row menu: rename + reveal in Finder + copy path + (for folders) open in vscode + delete
+
+    // Single-object menu
     const items: MenuEntry[] = [
       {
         label: '✏️ 重命名',
@@ -367,12 +450,16 @@ export function Column({
             }
             // No agent yet — open a new chat tab with claude in this folder
             const tabId = `folder:${fsPath}`
-            // Emit the same handler path as handleOpenAgent for a fresh folder agent
+            // Emit the same handler path as handleOpenAgent for a fresh
+            // folder agent. Pass project_id so handleOpenAgent can label
+            // the tab "📁 <parent project> / <alias>" instead of just the
+            // bare folder name.
             onOpenAgent?.({
               name: menuTarget.object.name,
               session_id: '',  // fresh session
               is_db: false,
               folder_path: fsPath,
+              project_id: menuTarget.object.project_id,
             })
           },
         })
@@ -383,6 +470,10 @@ export function Column({
     items.push({
       label: '🔗 重新链接目标',
       onClick: () => setDialog({ kind: 'relink-object', object: menuTarget.object }),
+    })
+    items.push({
+      label: '📎 引用到…',
+      onClick: () => setDialog({ kind: 'copy-to-object', object: menuTarget.object }),
     })
     items.push({ separator: true })
     items.push({
@@ -493,9 +584,24 @@ export function Column({
             // Drop handler: project/task accept drops (their contents belong
             // in that container); steps don't (sequential workflow).
             const acceptsDrop = !isStep
+            // stopPropagation on dragOver is essential: without it, the
+            // outer scroll container's dragOver fires right after and
+            // overwrites dragOverTarget back to 'self', so the row never
+            // lights up and the user can't tell it's a valid drop zone.
             const dropProps = acceptsDrop ? {
-              onDragOver: (e: React.DragEvent) => { handleObjectDragOver(e); setDragOverTarget(sp.id) },
-              onDragLeave: () => setDragOverTarget(prev => prev === sp.id ? null : prev),
+              onDragOver: (e: React.DragEvent) => {
+                handleObjectDragOver(e)
+                e.stopPropagation()
+                setDragOverTarget(sp.id)
+              },
+              onDragEnter: (e: React.DragEvent) => {
+                e.stopPropagation()
+                setDragOverTarget(sp.id)
+              },
+              onDragLeave: (e: React.DragEvent) => {
+                e.stopPropagation()
+                setDragOverTarget(prev => prev === sp.id ? null : prev)
+              },
               onDrop: async (e: React.DragEvent) => {
                 e.preventDefault()
                 e.stopPropagation()
@@ -533,7 +639,7 @@ export function Column({
                   ${isSelected
                     ? 'bg-primary text-primary-foreground'
                     : isDropTarget
-                      ? 'bg-primary/20 ring-1 ring-primary ring-inset'
+                      ? 'bg-primary/30 ring-2 ring-primary ring-inset shadow-lg'
                       : isBlocked
                         ? 'opacity-40 cursor-not-allowed'
                         : 'hover:bg-accent/50 cursor-pointer'
@@ -572,6 +678,11 @@ export function Column({
                 {!isStep && sp.progress > 0 && (
                   <span className="text-xs opacity-60 shrink-0">{sp.progress}%</span>
                 )}
+                {/* Step → right-aligned date chip: completed_at when done,
+                    due_at while pending. Click opens a date editor. */}
+                {isStep && (
+                  <StepDateChip step={sp} onChanged={load} isSelected={isSelected} />
+                )}
                 {/* Chevron only for things you can navigate into */}
                 {!isStep && <span className="opacity-40 text-xs shrink-0">›</span>}
               </div>
@@ -579,10 +690,8 @@ export function Column({
           })}
 
           {objects.map(o => {
-            // An object row is "highlighted" if either:
-            //  - it's the locally-selected row (setSelectedObjectId), OR
-            //  - a BrowseColumn has been pushed for it (selectedObjectBrowseId)
             const isHighlighted = selectedObjectId === o.id || selectedObjectBrowseId === o.target
+            const isMultiSelected = multiSelObjIds.has(o.id)
             return (
               <button
                 key={`o:${o.id}`}
@@ -598,15 +707,27 @@ export function Column({
                   })
                 }}
                 onContextMenu={(e) => handleObjectRowContextMenu(e, o)}
-                onClick={() => {
+                onClick={(e) => {
+                  // Ctrl/Cmd+click = toggle multi-select (doesn't navigate)
+                  if (e.ctrlKey || e.metaKey) {
+                    setMultiSelObjIds(prev => {
+                      const next = new Set(prev)
+                      if (next.has(o.id)) next.delete(o.id)
+                      else next.add(o.id)
+                      return next
+                    })
+                    return
+                  }
+                  // Plain click: clear any multi-selection, normal navigate
+                  setMultiSelObjIds(new Set())
                   setSelectedObjectId(o.id)
-                  // Always push a column — handleEnterObject decides
-                  // between browse (for folder-likes) and preview (for leaves)
                   onEnterObject?.(o)
                 }}
                 onDoubleClick={() => { window.lineup.openObject(o.id) }}
                 className={`w-full text-left px-3 py-2 flex items-start gap-2 text-sm transition-colors
-                  ${isHighlighted ? 'bg-primary text-primary-foreground' : 'hover:bg-accent/50'}`}
+                  ${isHighlighted ? 'bg-primary text-primary-foreground'
+                    : isMultiSelected ? 'bg-primary/20 ring-1 ring-primary ring-inset'
+                    : 'hover:bg-accent/50'}`}
               >
                 <span className={`text-xs px-1 py-0.5 rounded shrink-0 mt-0.5
                   ${isHighlighted ? 'bg-primary-foreground/20' : 'text-muted-foreground bg-muted'}`}>
@@ -702,6 +823,26 @@ export function Column({
         />
       )}
 
+      {dialog?.kind === 'copy-to-project' && (
+        <CopyToPicker
+          sourceLabel={dialog.project.name}
+          sourceKind="project"
+          sourceId={dialog.project.id}
+          onClose={() => setDialog(null)}
+          onLinked={() => { void load(); onColumnsChanged() }}
+        />
+      )}
+
+      {dialog?.kind === 'copy-to-object' && (
+        <CopyToPicker
+          sourceLabel={dialog.object.name}
+          sourceKind="object"
+          sourceId={dialog.object.id}
+          onClose={() => setDialog(null)}
+          onLinked={() => { void load(); onColumnsChanged() }}
+        />
+      )}
+
       {/* Obsidian / Trilium: browse dialog */}
       {dialog?.kind === 'browse' && (
         <BrowseDialog
@@ -713,6 +854,23 @@ export function Column({
               item.target,
               dialog.type.name
             )
+          }}
+          onCancel={() => setDialog(null)}
+        />
+      )}
+
+      {/* Insert step before/after an existing step */}
+      {dialog?.kind === 'insert-step-relative' && (
+        <InputDialog
+          title={dialog.position === 'before'
+            ? `在「${dialog.neighbor.name}」之前插入步骤`
+            : `在「${dialog.neighbor.name}」之后插入步骤`}
+          placeholder="步骤内容（一行）"
+          onSubmit={async (name) => {
+            await window.lineup.insertStepRelative(dialog.neighbor.id, dialog.position, name)
+            setDialog(null)
+            await load()
+            onColumnsChanged()
           }}
           onCancel={() => setDialog(null)}
         />
@@ -778,6 +936,16 @@ export function Column({
           onCancel={() => setDialog(null)}
         />
       )}
+      {dialog?.kind === 'confirm-bulk-delete-objects' && (
+        <ConfirmDialog
+          title={`删除 ${dialog.ids.length} 个对象？`}
+          message="只会从 lineup 中删除这些链接引用，不会删除实际文件/笔记。"
+          confirmLabel={`删除 ${dialog.ids.length} 个`}
+          danger
+          onConfirm={() => handleBulkDeleteObjects(dialog.ids)}
+          onCancel={() => setDialog(null)}
+        />
+      )}
     </>
   )
 }
@@ -798,6 +966,155 @@ function ProjectColorDot({ colors }: { colors?: string[] }) {
           style={{ background: PROJECT_COLORS[c] || '#94a3b8' }}
         />
       ))}
+    </span>
+  )
+}
+
+/**
+ * Right-aligned date chip on a step row:
+ *   - status='done' → ✓ {completed_at} (gray, click to edit)
+ *   - status pending → {due_at} (周X), color reflects overdue/soon
+ *   - no due → "设 ddl" placeholder
+ *
+ * Click opens a small popover with a native date picker + quick-extend
+ * buttons. The popover validates against earlier-sibling dues (so a step
+ * can't be earlier than one that must precede it) and auto-bumps the
+ * parent task's due if the user picks a date later than parent — bump
+ * is server-side in setProjectMeta.
+ */
+function StepDateChip({ step, onChanged, isSelected }: {
+  step: Project
+  onChanged: () => void
+  isSelected: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [bounds, setBounds] = useState<{ min: string | null; parent_due: string | null }>({
+    min: null, parent_due: null,
+  })
+  const popRef = useRef<HTMLDivElement>(null)
+  const dateInputRef = useRef<HTMLInputElement>(null)
+
+  // Fetch bounds when the popover opens — they can't change while it's
+  // open since the user is the only one editing.
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    window.lineup.getStepDueBounds(step.id).then(b => {
+      if (!cancelled) setBounds(b)
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [open, step.id])
+
+  // Click-outside dismiss
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (popRef.current && !popRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+
+  const isDone = step.status === 'done'
+  const completed = step.completed_at
+  const due = step.due_at ? step.due_at.slice(0, 10) : null
+
+  // Visual chip — done state always wins (steps marked done before the
+  // completed_at migration won't have a date but should still show as ✓
+  // gray, NOT fall through to overdue-due-date colors).
+  let chipText: string
+  let chipCls = 'text-muted-foreground'
+  if (isDone) {
+    chipText = completed ? `✓ ${fmtMD(completed)}` : '✓ 已完成'
+  } else if (due) {
+    const today = todayStr()
+    const days = Math.ceil((new Date(due).getTime() - new Date(today).getTime()) / 86_400_000)
+    if (days < 0) chipCls = 'text-red-400'
+    else if (days <= 3) chipCls = 'text-amber-400'
+    chipText = `${fmtMD(due)} (${weekdayCN(due)})`
+  } else {
+    chipText = '设 ddl'
+    chipCls = 'text-muted-foreground/60 italic'
+  }
+
+  async function setDate(next: string | null) {
+    // Enforce monotonic sibling order: if user picks earlier than the max
+    // earlier sibling's due, snap up to that minimum.
+    let v = next
+    if (v && bounds.min && v < bounds.min) v = bounds.min
+    if (isDone) {
+      // Editing completion date — only completed_at, do NOT touch due/parent.
+      await window.lineup.setProjectMeta(step.id, { completed_at: v })
+    } else {
+      await window.lineup.setProjectMeta(step.id, { due_at: v })
+    }
+    onChanged()
+    setOpen(false)
+  }
+
+  const baseDate = (isDone ? completed : due) || todayStr()
+
+  return (
+    <span className="relative shrink-0">
+      <button
+        onClick={(e) => { e.stopPropagation(); setOpen(o => !o) }}
+        className={`text-[11px] px-1 py-0.5 rounded hover:bg-accent/40 ${chipCls} ${
+          isSelected ? 'text-primary-foreground/80 hover:bg-primary-foreground/10' : ''
+        }`}
+        title={isDone ? '完成日期（点击修改）' : '截止日期（点击修改）'}
+      >{chipText}</button>
+      {open && (
+        <div
+          ref={popRef}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute right-0 top-full mt-1 z-30 w-60 p-2 rounded-md border border-border bg-popover shadow-xl text-xs space-y-2"
+        >
+          <div className="flex items-center gap-1">
+            <input
+              ref={dateInputRef}
+              type="date"
+              defaultValue={baseDate}
+              min={!isDone && bounds.min ? bounds.min : undefined}
+              onChange={async e => {
+                const v = e.target.value || null
+                await setDate(v)
+              }}
+              className="bg-input border border-border rounded px-2 py-1 flex-1 focus:outline-none focus:ring-1 focus:ring-ring"
+            />
+            {due && !isDone && (
+              <button
+                onClick={() => setDate(null)}
+                className="px-2 py-1 rounded border border-border text-muted-foreground hover:bg-accent/50"
+                title="清除截止日期"
+              >×</button>
+            )}
+          </div>
+          {!isDone && (bounds.min || bounds.parent_due) && (
+            <div className="text-[10px] text-muted-foreground space-y-0.5">
+              {bounds.min && <div>最早: {bounds.min}（前一 step）</div>}
+              {bounds.parent_due && <div>父 task: {bounds.parent_due}（超过会自动顺延）</div>}
+            </div>
+          )}
+          <div className="flex gap-1 flex-wrap">
+            <button
+              onClick={() => setDate(todayStr())}
+              className="px-2 py-0.5 rounded border border-border/70 text-muted-foreground hover:bg-accent/50 text-[11px]"
+            >今天</button>
+            {[
+              { label: '+1 天', days: 1 },
+              { label: '+3 天', days: 3 },
+              { label: '+1 周', days: 7 },
+              { label: '+2 周', days: 14 },
+            ].map(opt => (
+              <button
+                key={opt.days}
+                onClick={() => setDate(addDaysToDateStr(baseDate, opt.days))}
+                className="px-2 py-0.5 rounded border border-border/70 text-muted-foreground hover:bg-accent/50 text-[11px]"
+              >{opt.label}</button>
+            ))}
+          </div>
+        </div>
+      )}
     </span>
   )
 }

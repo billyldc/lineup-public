@@ -30,7 +30,7 @@ def lineup_create_project(
        **没有**同名的 project / task / step 已经存在；如果存在就优先复用它，
        不要新建。
     2. **弄清楚用户要的到底是 project、task 还是 step**。这三个是完全不同的层级：
-       - `project` = 长期工作区，可以嵌套 project 和 task（例如 `research`, `work`, `personal`）
+       - `project` = 长期工作区，可以嵌套 project 和 task（例如 `review`, `research`, `实习`）
        - `task` = 一次具体的工作单元，可以包含 step；task 之间是并行的
        - `step` = task 内的顺序 checklist 步骤，只能由 agent 建
        用户如果说"子项目"/"子任务"/"步骤"模糊不清（例如只说"新建一个"），
@@ -57,7 +57,7 @@ def lineup_create_task(
 ) -> str:
     """在一个 project 下新建一个 task。
 
-    task 是一次具体工作的单元（例如 "review paper X", "prepare presentation Y"）。
+    task 是一次具体工作的单元（例如"审稿 FOCS26 paper 42"、"投简历到 XX 公司"）。
     task 之间默认**并行** —— 多个 task 可以同时进行，互不阻塞。如果你要把一次工作
     拆成必须按顺序完成的步骤，把这些步骤建成 **step**（用 `lineup_create_step`），
     不要建成多个 task。
@@ -154,21 +154,12 @@ def lineup_list_children(parent: str) -> str:
     return store.list_children(parent)
 
 
-@mcp.tool()
-def lineup_create_document(
-    name: str,
-    description: str = "",
-    priority: int = 3,
-    parent: str | None = None,
-) -> str:
-    """创建一个新文档（知识沉淀，区别于项目）。
-
-    name: 文档名称
-    description: 文档描述
-    priority: 优先级 1-5，5 最高，默认 3
-    parent: 父项目/文档名称（可选）
-    """
-    return store.create_project(name, description, priority, parent, type="document")
+## NOTE: `lineup_create_document` was removed (2026-05-03). Documents are
+## a legacy knowledge-bin concept that the lineup Electron sidebar doesn't
+## render (it filters type IN (NULL, 'project')). When this tool was
+## exposed to AI, document rows became "ghost" projects — visible to AI
+## triage but invisible in the UI. Document rows are now created only via
+## `lu document create` (user-driven, intentional), not by AI.
 
 
 @mcp.tool()
@@ -193,16 +184,25 @@ def lineup_link(
     type: str = "file",
     project: str | None = None,
     default_app: str | None = None,
+    cwd: str | None = None,
 ) -> str:
     """将一个对象（文件/文件夹/URL/Zotero文献/脚本）链接到项目中。
 
     target: 目标路径或 URI（如 ~/Documents/thesis/、https://...、zotero://...）
     name: 对象在项目中的显示名称
     type: 对象类型（file/folder/url/zotero/script），可自动检测
-    project: 项目名称（可选，默认为当前活跃项目）
-    default_app: 默认打开应用（可选，如 "Visual Studio Code"），设置后每次 open 都会用该应用打开
+    project: 项目名称（可选）。优先级：(1) 显式传值；(2) 由 cwd 推断；
+        (3) 兜底用活跃项目。走到 (3) 返回值开头会带 ⚠ 警告。
+    default_app: 默认打开应用（可选，如 "Visual Studio Code"）
+    cwd: **强烈建议传你的当前工作目录**（即 pwd 输出）。MCP server 是
+        独立进程，看不到你 agent 的真实 cwd，不传的话第 (2) 步推断会基于
+        server 进程的 cwd（通常是 ~/lineup），导致误判。Plan C 下 agent
+        的 cwd 一般是 ~/.lineup/projects/<.../><项目名>/，传过来就能精确
+        命中正确项目，连 project 参数都不用想。
     """
-    return store.link_object(target, name, type, project, default_app=default_app)
+    return store.link_object(
+        target, name, type, project, default_app=default_app, cwd=cwd,
+    )
 
 
 @mcp.tool()
@@ -225,8 +225,13 @@ def lineup_open_object(
     name: 对象名称
     app: 指定应用名称（可选，如 "Preview"、"VS Code"）
     project: 项目名称（可选，默认为当前活跃项目）
+
+    URL 对象默认走 lineup-managed Chrome tab group（via=managed）—— agent
+    打开网页时优先送进用户已开的浏览器分组里、不会污染默认浏览器；
+    bridge 连不上时自动 fallback 回系统默认 open。其他类型对象（文件 /
+    文献 / 邮件 / 笔记）不受影响，仍走类型注册表里各自的 open_command。
     """
-    return store.open_object(name, app, project)
+    return store.open_object(name, app, project, via="managed")
 
 
 @mcp.tool()
@@ -262,7 +267,7 @@ def lineup_dispatch_agent(
     这是通用 agent 跨文件夹调度的核心工具。用法举例：
 
         lineup_dispatch_agent(
-            folder="~/my-website",
+            folder="/path/to/some/project",
             prompt="请更新 CV 里的 Recent Projects 部分，加入最近一个月的项目"
         )
 
@@ -374,7 +379,7 @@ def lineup_progress_set(
 
     percent: 进度百分比(0-100)，传 -1 清除进度
     project: 项目名称(可选,默认为当前活跃项目)
-    note: 进度备注（可选，如 "waiting for feedback"、"初稿完成"）
+    note: 进度备注（可选，如 "等待审稿意见"、"初稿完成"）
     """
     return store.progress_set(percent, project, note=note)
 
@@ -544,6 +549,108 @@ def lineup_obsidian_link(
 
 
 @mcp.tool()
+def lineup_mail_search(query: str, limit: int = 20) -> str:
+    """搜索 Apple Mail 邮件（按主题 / 发件人 / 通讯录显示名模糊匹配）。
+
+    直接查 Mail.app 的 Envelope Index SQLite（毫秒级），**不走 AppleScript**，
+    所以 Exchange / 大邮箱也能秒搜。返回条目里的 target 可以直接传给
+    `lineup_mail_link` 或 `lineup_mail_read`。
+
+    query: 搜索关键词（中英文都可）
+    limit: 最多返回条数（默认 20）
+    """
+    plugin = plugins.get("mail")
+    if not plugin:
+        return "错误：Mail 插件未加载"
+    items = plugin.search(query, limit)
+    if not items:
+        return f"未找到匹配 \"{query}\" 的邮件"
+    lines = [f"找到 {len(items)} 封："]
+    for item in items:
+        preview = f"  {item.preview}" if item.preview else ""
+        lines.append(f"  {item.name}  [{item.target}]{preview}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def lineup_mail_read(target: str) -> str:
+    """读取一封邮件的结构化内容（主题 / 发件人 / 日期 / 正文）。
+
+    target: 从 `lineup_mail_search` / `lineup_mail_browse` 返回的 target，
+            形如 `mailrow:<ROWID>` 或 `message://<Message-ID>`。
+    """
+    plugin = plugins.get("mail")
+    if not plugin:
+        return "错误：Mail 插件未加载"
+    data = plugin.preview(target)
+    if "error" in data:
+        return f"错误：{data['error']}"
+    parts = []
+    if data.get("subject"): parts.append(f"主题: {data['subject']}")
+    if data.get("from"):    parts.append(f"发件人: {data['from']}")
+    if data.get("to"):      parts.append(f"收件人: {data['to']}")
+    if data.get("cc"):      parts.append(f"抄送: {data['cc']}")
+    if data.get("date"):    parts.append(f"日期: {data['date']}")
+    parts.append("")
+    body = data.get("text") or data.get("html") or "(正文为空)"
+    parts.append(body)
+    return "\n".join(parts)
+
+
+@mcp.tool()
+def lineup_mail_browse(path: str = "") -> str:
+    """浏览 Apple Mail。
+
+    path 为空时返回：所有账户（作为文件夹）+ 最近 40 封 unified 收件箱
+    path 以 `account:<UUID>` 格式时：返回该账户最近 80 封
+    """
+    plugin = plugins.get("mail")
+    if not plugin:
+        return "错误：Mail 插件未加载"
+    items = plugin.browse(path)
+    if not items:
+        return "（空）"
+    lines = []
+    for item in items:
+        icon = "📁" if item.type == "folder" else "📧"
+        lines.append(f"  {icon} {item.name}  [{item.target}]")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def lineup_mail_link(
+    target: str,
+    name: str | None = None,
+    project: str | None = None,
+) -> str:
+    """把一封邮件挂到 lineup 项目里作为对象。
+
+    target: `mailrow:<ROWID>` 或 `message://<MID>`（从搜索/浏览结果里拷贝）
+    name: 在 lineup 中显示的名字（默认为邮件主题，会自动从 target 解析）
+    project: 目标项目名（可选，默认为当前活跃项目）
+    """
+    plugin = plugins.get("mail")
+    if not plugin:
+        return "错误：Mail 插件未加载"
+    # Derive a name if not provided — preview the email to grab its subject.
+    if not name:
+        data = plugin.preview(target)
+        if "error" not in data and data.get("subject"):
+            name = data["subject"][:120]
+    if not name:
+        name = target[:80]
+    return store.link_object(
+        target=target,
+        name=name,
+        type="mail",
+        project=project,
+        default_app="Mail",
+    )
+
+
+
+
+@mcp.tool()
 def lineup_obsidian_vaults() -> str:
     """列出检测到的 Obsidian vault 路径。"""
     plugin = plugins.get("obsidian")
@@ -644,87 +751,15 @@ def lineup_trilium_link(
     )
 
 
-@mcp.tool()
-def lineup_todoist_sync(
-    dry_run: bool = True,
-    create_missing: bool = False,
-    skip: list[str] | None = None,
-) -> str:
-    """同步 Todoist 项目到 lineup 项目。
-
-    策略：按名称匹配——已存在的 lineup 项目会被自动「链接」到同名的 Todoist 项目；
-    没匹配的 Todoist 项目（仅在 create_missing=True 时）会被创建为新的 lineup 项目。
-    Todoist 的 Inbox 默认跳过（它是收件箱本身，不应映射成项目）。
-
-    参数：
-      dry_run: 默认 True，只返回计划不写库。设为 False 才真正执行。
-      create_missing: 默认 False。为 True 时，未匹配的 Todoist 项目会在 lineup 中新建。
-      skip: 额外要跳过的 Todoist 项目名列表。
-
-    依赖：本机须安装 @doist/todoist-cli 并已 td auth login。
-    """
-    from lineup.plugins import todoist as td_plugin
-
-    try:
-        projects = td_plugin.fetch_projects()
-    except td_plugin.TodoistError as e:
-        return f"错误：{e}"
-
-    actions = td_plugin.plan_sync(projects, extra_skip=set(skip or []))
-
-    lines = [f"Todoist → lineup 同步计划（{len(projects)} 个项目）"]
-    for a in actions:
-        marker = {
-            "skip": "·",
-            "already-linked": "=",
-            "link": "↔",
-            "create": "+",
-        }.get(a.kind, "?")
-        line = f"  {marker} [{a.kind}] {a.todoist.name}"
-        if a.lineup_id is not None:
-            line += f"  → lineup #{a.lineup_id} ({a.lineup_name})"
-        if a.note:
-            line += f"  [{a.note}]"
-        if a.kind == "create" and not create_missing:
-            line += "  — 跳过（需 create_missing=True 才创建）"
-        lines.append(line)
-
-    if dry_run:
-        lines.append("\n[dry_run=True] 未执行任何修改。如要执行请再调一次并传 dry_run=False")
-        return "\n".join(lines)
-
-    summary = td_plugin.apply_sync(actions, create_missing=create_missing)
-    lines.append(
-        f"\n完成：linked={summary.linked}, created={summary.created}, "
-        f"create_skipped={summary.create_skipped}, "
-        f"already={summary.already}, skipped={summary.skipped}"
-    )
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def lineup_todoist_link(todoist_ref: str, lineup_name: str) -> str:
-    """手动把一个 lineup 项目链接到 Todoist 项目。
-
-    todoist_ref: Todoist 项目名称，或 "id:xxx"
-    lineup_name: lineup 项目名称（必须已存在）
-
-    用于名字不一致但语义对应的情况。例如：
-      lineup_todoist_link("my-project", "todoist-project")
-      lineup_todoist_link("自动化", "productivity")
-    """
-    from lineup.plugins import todoist as td_plugin
-    try:
-        return td_plugin.link_project(todoist_ref, lineup_name)
-    except td_plugin.TodoistError as e:
-        return f"错误：{e}"
-
-
-@mcp.tool()
-def lineup_todoist_unlink(lineup_name: str) -> str:
-    """解除 lineup 项目和 Todoist 的链接（lineup 项目本身保留）。"""
-    from lineup.plugins import todoist as td_plugin
-    return td_plugin.unlink_project(lineup_name)
+## NOTE: Todoist MCP tools disabled 2026-05-06 — user no longer uses
+## Todoist as an active task surface. Keeping the CLI counterparts
+## (`lu todoist sync / link / unlink`) for one-off cleanup, but the
+## AI doesn't need this tool surface anymore. Restore the @mcp.tool
+## decorators below if Todoist comes back into the workflow.
+##
+## def lineup_todoist_sync(dry_run, create_missing, skip): ...
+## def lineup_todoist_link(todoist_ref, lineup_name): ...
+## def lineup_todoist_unlink(lineup_name): ...
 
 
 def main():

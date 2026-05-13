@@ -5,6 +5,10 @@ import '@xterm/xterm/css/xterm.css'
 
 interface TerminalProps {
   cwd: string
+  /** ChatPanel-assigned id used to address this terminal from outside
+   *  (e.g. PendingSendBanner's "▶ 发送" button dispatches a
+   *  `lineup:terminal:send` event with this id). */
+  tabId?: string
   // Optional one-shot command. If provided the shell runs it via `-c`
   // (e.g. `claude --resume <session_id>`) and exits when done.
   command?: string
@@ -12,6 +16,13 @@ interface TerminalProps {
   onExit?: (exitCode: number) => void
   // Font size in px. Changes apply live and trigger a re-fit.
   fontSize?: number
+  // When true this terminal is the currently visible / active tab.
+  isActive?: boolean
+  // Called whenever the tab's busy-state flips: 'running' while pty bytes
+  // are streaming, 'idle' after ~800ms of silence. ChatPanel uses this to
+  // tint the tab label orange and fire a macOS notification on transition
+  // to idle for non-active tabs.
+  onActivityChange?: (state: 'running' | 'idle') => void
 }
 
 /**
@@ -19,11 +30,51 @@ interface TerminalProps {
  * Lifecycle: spawns one pty on mount, kills it on unmount.
  * Resize: a ResizeObserver on the host div re-fits xterm on layout changes.
  */
-export function Terminal({ cwd, command, onExit, fontSize = 13 }: TerminalProps) {
+export function Terminal({ cwd, tabId, command, onExit, fontSize = 13, isActive = true, onActivityChange }: TerminalProps) {
   const hostRef = useRef<HTMLDivElement>(null)
   const xtermRef = useRef<XTerm | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const ptyIdRef = useRef<string | null>(null)
+  const isActiveRef = useRef(isActive)
+  useEffect(() => { isActiveRef.current = isActive }, [isActive])
+  const tabIdRef = useRef(tabId)
+  useEffect(() => { tabIdRef.current = tabId }, [tabId])
+
+  // Global "paste into active chat" event — fired by e.g. the 收件箱 inline
+  // "和主 agent 讨论" button. Only the active terminal responds.
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const e = ev as CustomEvent<{ text: string; targetTabId?: string }>
+      if (!isActiveRef.current) return
+      const id = ptyIdRef.current
+      if (!id || !e.detail?.text) return
+      window.lineup.writePty(id, e.detail.text)
+    }
+    window.addEventListener('lineup:chat:paste', handler)
+    return () => window.removeEventListener('lineup:chat:paste', handler)
+  }, [])
+
+  // Targeted send: PendingSendBanner fires this when the user clicks ▶ on
+  // a queued inbox-proposal prompt. We match by tabId (NOT isActive) so a
+  // user can queue, switch tabs, switch back, and still send. The trailing
+  // \r submits the prompt — Claude reads pty input as raw bytes; \r is
+  // Enter in raw mode. (We can't use clipboard + simulated paste because
+  // claude's resume modal can be in front and would eat the keystrokes —
+  // hence the explicit user-confirmed click.)
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const e = ev as CustomEvent<{ tabId: string; text: string }>
+      if (!e.detail || e.detail.tabId !== tabIdRef.current) return
+      const id = ptyIdRef.current
+      if (!id || !e.detail.text) return
+      const text = e.detail.text
+      // Write the prompt then \r so Claude submits it. \r alone (no \n)
+      // is what a real Enter sends in raw-mode TTY.
+      window.lineup.writePty(id, text.endsWith('\r') ? text : text + '\r')
+    }
+    window.addEventListener('lineup:terminal:send', handler)
+    return () => window.removeEventListener('lineup:terminal:send', handler)
+  }, [])
 
   // Apply font size changes to a live xterm instance.
   useEffect(() => {
@@ -82,8 +133,28 @@ export function Terminal({ cwd, command, onExit, fontSize = 13 }: TerminalProps)
       }
       ptyIdRef.current = res.id
 
+      // Activity tracking: every incoming byte flips us to 'running' (if
+      // not already), and a 800ms silence timer fires 'idle'. The dead
+      // zone is tuned for Claude Code — it prints a streaming spinner
+      // every ~200ms while running, and stops emitting once it hits the
+      // input prompt or finishes.
+      let idleTimer: ReturnType<typeof setTimeout> | null = null
+      let activityState: 'running' | 'idle' = 'idle'
+      const IDLE_DELAY = 800
       disposeData = window.lineup.onPtyData((id, data) => {
-        if (id === res.id) term.write(data)
+        if (id !== res.id) return
+        term.write(data)
+        if (activityState !== 'running') {
+          activityState = 'running'
+          onActivityChange?.('running')
+        }
+        if (idleTimer) clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => {
+          if (activityState !== 'idle') {
+            activityState = 'idle'
+            onActivityChange?.('idle')
+          }
+        }, IDLE_DELAY)
       })
       disposeExit = window.lineup.onPtyExit((id, exitCode) => {
         if (id !== res.id) return
@@ -95,21 +166,85 @@ export function Terminal({ cwd, command, onExit, fontSize = 13 }: TerminalProps)
       })
     })
 
-    // Capture-phase handler for Ctrl+O (Claude Code's "expand tool details"
-    // shortcut). Something between the browser and xterm swallows it in our
-    // embedded setup, so we intercept in capture phase and write \x0f
-    // (ASCII SI = Ctrl+O) directly to the pty. Only fires when focus is
-    // inside THIS terminal's host element.
+    // Capture-phase handler for Ctrl+O / Cmd+O (Claude Code's "expand
+    // tool details" shortcut). Something between the browser and xterm
+    // swallows it in our embedded setup, so we intercept in capture
+    // phase and write \x0f (ASCII SI = Ctrl+O) directly to the pty.
+    // Accepts Cmd+O too because macOS users instinctively reach for ⌘
+    // and it's not bound to anything else here. Gates on isActive
+    // instead of `host.contains(activeElement)` — focus drifts to body
+    // sometimes (after a modal closes, or the app re-focuses) and the
+    // user expects the visible terminal to respond regardless.
     const onCtrlO = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey && !e.metaKey && !e.altKey)) return
+      if (e.altKey) return
       if (e.key !== 'o' && e.key !== 'O') return
-      if (!host.contains(document.activeElement)) return
+      const ctrlOnly = e.ctrlKey && !e.metaKey
+      const cmdOnly = e.metaKey && !e.ctrlKey
+      if (!ctrlOnly && !cmdOnly) return
+      if (!isActiveRef.current) return
       e.preventDefault()
       e.stopPropagation()
       const id = ptyIdRef.current
       if (id) window.lineup.writePty(id, '\x0f')
     }
     window.addEventListener('keydown', onCtrlO, true)
+
+    // Smart paste: when clipboard has file URLs (Finder copy), write
+    // shell-escaped paths to pty instead of letting xterm.js paste the
+    // file as an image. macOS Terminal.app does the same thing — copy
+    // a file in Finder, ⌘V in the terminal, get the path. Falls back
+    // to plain text paste when no files are present, which still
+    // writes through the pty (xterm.js's default would do the same,
+    // but routing through us keeps behavior uniform).
+    const onPaste = async (ev: ClipboardEvent) => {
+      if (!isActiveRef.current) return
+      const id = ptyIdRef.current
+      if (!id) return
+      try {
+        const r = await window.lineup.readClipboardForTerminal()
+        if (r.files && r.files.length > 0) {
+          ev.preventDefault()
+          ev.stopPropagation()
+          const escaped = r.files.map(p =>
+            /[^a-zA-Z0-9._/~-]/.test(p) ? `'${p.replace(/'/g, "'\\''")}'` : p
+          ).join(' ')
+          window.lineup.writePty(id, escaped)
+        } else if (r.text) {
+          // Let xterm.js handle plain text paste (its default works
+          // fine — bracketed-paste-aware). No-op here.
+        }
+      } catch { /* swallow — falls back to default paste */ }
+    }
+    window.addEventListener('paste', onPaste, true)
+
+    // Finder drag-and-drop: capture-phase native listener so xterm.js /
+    // the default browser image-drop handler don't fire first. Pastes
+    // shell-escaped file paths into the pty, like Terminal.app.
+    const onNativeDragOver = (ev: DragEvent) => {
+      if (ev.dataTransfer?.types.includes('Files')) {
+        ev.preventDefault()
+        ev.stopPropagation()
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy'
+      }
+    }
+    const onNativeDrop = (ev: DragEvent) => {
+      const files = ev.dataTransfer?.files
+      if (!files || files.length === 0) return
+      ev.preventDefault()
+      ev.stopPropagation()
+      const paths = Array.from(files)
+        .map(f => { try { return window.lineup.getPathForFile(f) } catch { return '' } })
+        .filter(p => !!p)
+      if (paths.length === 0) return
+      const id = ptyIdRef.current
+      if (!id) return
+      const escaped = paths.map(p =>
+        /[^a-zA-Z0-9._/~-]/.test(p) ? `'${p.replace(/'/g, "'\\''")}'` : p
+      ).join(' ')
+      window.lineup.writePty(id, escaped)
+    }
+    host.addEventListener('dragover', onNativeDragOver, true)
+    host.addEventListener('drop', onNativeDrop, true)
 
     // Re-fit on container size changes
     const ro = new ResizeObserver(() => {
@@ -125,6 +260,7 @@ export function Terminal({ cwd, command, onExit, fontSize = 13 }: TerminalProps)
       disposed = true
       ro.disconnect()
       window.removeEventListener('keydown', onCtrlO, true)
+      window.removeEventListener('paste', onPaste, true)
       disposeData?.()
       disposeExit?.()
       const id = ptyIdRef.current
@@ -140,15 +276,18 @@ export function Terminal({ cwd, command, onExit, fontSize = 13 }: TerminalProps)
   }, [])
 
   // Finder drag-and-drop: paste file paths into the pty, matching what
-  // Terminal.app does. Electron's File objects have a .path property.
+  // Terminal.app does. Electron 32+ removed `file.path` — must use
+  // webUtils.getPathForFile via preload bridge.
   function handleFileDrop(e: React.DragEvent) {
     e.preventDefault()
     e.stopPropagation()
     const files = e.dataTransfer.files
     if (files.length === 0) return
     const paths = Array.from(files)
-      .map(f => (f as File & { path?: string }).path)
-      .filter((p): p is string => !!p)
+      .map(f => {
+        try { return window.lineup.getPathForFile(f) } catch { return '' }
+      })
+      .filter(p => !!p)
     if (paths.length === 0) return
     const id = ptyIdRef.current
     if (!id) return

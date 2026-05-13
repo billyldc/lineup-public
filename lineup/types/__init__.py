@@ -55,6 +55,8 @@ def load_all():
     from lineup.types import zotero    # noqa: F401
     from lineup.types import obsidian  # noqa: F401
     from lineup.types import trilium   # noqa: F401
+    from lineup.types import mail      # noqa: F401
     from lineup.types import folder    # noqa: F401
     from lineup.types import script    # noqa: F401
+    from lineup.types import contact   # noqa: F401
     from lineup.types import file      # noqa: F401

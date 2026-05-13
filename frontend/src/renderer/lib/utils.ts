@@ -20,10 +20,11 @@ export function filesystemPathForObject(obj: ObjectRow): string | null {
     return obj.target
   }
   if (obj.type === 'trilium') {
-    // Local Trilium data dir (document.db is the database)
-    const trilliumPath = require('os').homedir() + '/Library/Application Support/trilium-data/document.db'
-    // Note: we can't easily check existence from renderer; caller should handle failures
-    return trilliumPath
+    // Trilium data dir lives at ~/Library/Application Support/trilium-data/
+    // when Trilium Desktop is installed. The renderer can't compute homedir
+    // itself; the main process resolves this at open-time, so return null
+    // here and let the open-target IPC handle path resolution.
+    return null
   }
   return null
 }

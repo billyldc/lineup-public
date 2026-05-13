@@ -35,17 +35,28 @@ Built with Electron + React + TypeScript + Tailwind CSS + better-sqlite3.
 - Eisenhower matrix (important × urgent) with auto-urgent from due dates
 - Recurring tasks with auto-reset
 - Today / Eisenhower / Inbox filtered views
+- Pin projects to the sidebar, color-code, track progress per sub-project
 
 **File integration**
 - Preview files inline: Markdown (with LaTeX math), PDF, images, DOCX, XLSX, HTML
 - Preview URLs via embedded browser (with persistent cookies)
-- Link objects from filesystem, Obsidian vaults, Trilium notes, Zotero collections
+- Full-text search across linked objects (⌘F)
+
+**Information sources** *(opt-in, each activates only if the underlying app is installed)*
+- **Apple Mail** — search and link messages from any account Mail.app syncs (iCloud, Gmail, Exchange, IMAP)
+- **Obsidian** — browse vaults, link notes
+- **Trilium** — browse notes from a Trilium server
+- **Zotero** — browse collections, link papers and PDFs
+- **Todoist** — one-way sync of Todoist projects into lineup
+- See [docs/sources.md](docs/sources.md) for setup, especially the email walkthrough
 
 **AI agent system** *(optional, requires [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code))*
 - Embedded terminal (xterm.js + node-pty) running Claude Code per project
-- Per-project virtual workspace with auto-generated CLAUDE.md
+- Per-project virtual workspace with auto-generated CLAUDE.md (editable from the inspector drawer)
 - Agent dispatch: main agent can orchestrate sub-agents across folders
 - MCP integration for structured project/task/step management
+- Agents view: navigate Claude Code sessions across all projects, drill into individual session timelines
+- Live memory monitor for diagnosing runaway Electron / pty processes
 
 ## Quick start
 
@@ -128,18 +139,25 @@ Create `~/.lineup/config.json` to customize paths (all fields optional):
 ```json
 {
   "triliumServerUrl": "http://localhost:37840",
-  "zoteroDbPath": "~/Zotero/zotero.sqlite"
+  "zoteroDbPath": "~/Zotero/zotero.sqlite",
+  "obsidianVaultRoots": ["~/Documents", "~/Obsidian"]
 }
 ```
+
+See [docs/sources.md](docs/sources.md) for the full source-by-source setup walkthrough — including how to wire up Apple Mail (the most useful source for most users) without touching IMAP / OAuth yourself.
 
 ## Keyboard shortcuts
 
 | Key | Action |
 |-----|--------|
 | Cmd+N | Quick-add task to Inbox |
+| Cmd+F | Full-text search across projects + objects |
+| Cmd+, | Settings |
 | Left arrow | Go back one column |
 | Esc | Go to root |
 | Cmd +/- / Cmd+0 | Terminal font size |
+
+Hotkeys are remappable in Settings → 启动行为.
 
 ## Tech stack
 

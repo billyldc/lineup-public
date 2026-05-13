@@ -4,6 +4,25 @@ import type { Project, ObjectRow } from '../../preload/index'
 const typeLabels: Record<string, string> = {
   file: '文件', folder: '文件夹', url: '链接', zotero: '文献',
   trilium: '笔记', obsidian: '笔记', script: '脚本',
+  mail: '邮件', contact: '联系人',
+}
+
+function weekdayCN(dateStr: string): string {
+  const d = new Date(dateStr.slice(0, 10))
+  if (Number.isNaN(d.getTime())) return ''
+  // Chinese convention: week ends on Sunday. JS getDay() returns 0=Sun ...
+  // 6=Sat, so we index directly with that — '周日' lands at index 0 which
+  // is what getDay() emits for Sundays.
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()]
+}
+
+function addDaysToDateStr(dateStr: string, days: number): string {
+  const d = new Date(dateStr.slice(0, 10))
+  d.setDate(d.getDate() + days)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
 }
 
 const DEFAULT_INSPECTOR_WIDTH = 300
@@ -211,6 +230,19 @@ export function Inspector({ projectId, refreshSignal, onOpenMainAgent, onProject
             >
               🤖 主 agent
             </button>
+            {(project.type === 'project' || !project.type) && (
+              <button
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('lineup:open-project-claude-md', {
+                    detail: { projectId: project.id, projectName: project.name },
+                  }))
+                }}
+                className="shrink-0 text-xs px-2 py-1 rounded border border-border hover:bg-accent"
+                title="编辑这个项目主 agent 的 CLAUDE.md.manual（system prompt 叠层）"
+              >
+                📝
+              </button>
+            )}
           </div>
 
           {/* Corner actions: pin + archive (only for project type) */}
@@ -321,8 +353,11 @@ export function Inspector({ projectId, refreshSignal, onOpenMainAgent, onProject
                 }}
               />
             </div>
-            {project.type === 'task' && (
+            {(project.type === 'task' || project.type === 'step') && (
               <div className="mt-3 space-y-2">
+                {/* 截止 row: date input + "今天" button, then the countdown
+                    on the very next line so the user can read both
+                    together without the 每N天提醒 field splitting them. */}
                 <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-2 items-center text-xs">
                   <label className="text-muted-foreground">截止</label>
                   <div className="flex gap-1 items-center">
@@ -341,6 +376,18 @@ export function Inspector({ projectId, refreshSignal, onOpenMainAgent, onProject
                       }}
                       className="bg-input border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-ring flex-1"
                     />
+                    {project.due_at && (
+                      <span className="px-1.5 py-0.5 rounded bg-muted/40 text-muted-foreground shrink-0 text-[11px]">
+                        {weekdayCN(project.due_at)}
+                      </span>
+                    )}
+                  </div>
+                  {/* DDL quick-modifiers — 今天 / +N — all change due_at,
+                      grouped on one line so the inputs above don't get
+                      cluttered. +N extends the current due if set, else
+                      counts from today. */}
+                  <span />
+                  <div className="flex gap-1 flex-wrap">
                     <button
                       onClick={async () => {
                         const d = new Date()
@@ -349,12 +396,50 @@ export function Inspector({ projectId, refreshSignal, onOpenMainAgent, onProject
                         await window.lineup.setProjectMeta(project.id, { due_at: today })
                         load()
                       }}
-                      className="px-2 py-1 rounded border border-border text-muted-foreground hover:bg-accent/50"
+                      className="px-2 py-0.5 rounded border border-border/70 text-muted-foreground hover:bg-accent/50 text-[11px]"
                       title="设为今天"
-                    >
-                      今天
-                    </button>
+                    >今天</button>
+                    {[
+                      { label: '+1 天',  days: 1 },
+                      { label: '+3 天',  days: 3 },
+                      { label: '+1 周',  days: 7 },
+                      { label: '+2 周',  days: 14 },
+                    ].map(opt => (
+                      <button
+                        key={opt.days}
+                        onClick={async () => {
+                          const base = project.due_at
+                            ? project.due_at.slice(0, 10)
+                            : (() => {
+                                const d = new Date()
+                                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+                              })()
+                          const next = addDaysToDateStr(base, opt.days)
+                          if (dueRef.current) dueRef.current.value = next
+                          await window.lineup.setProjectMeta(project.id, { due_at: next })
+                          load()
+                        }}
+                        className="px-2 py-0.5 rounded border border-border/70 text-muted-foreground hover:bg-accent/50 text-[11px]"
+                        title={project.due_at ? `从当前截止日期顺延 ${opt.days} 天` : `从今天起 ${opt.days} 天后`}
+                      >{opt.label}</button>
+                    ))}
                   </div>
+                  {/* DDL countdown — sits right under the due date for easy
+                      visual calculation, NOT after the reminder field. */}
+                  {project.due_at && (() => {
+                    const due = new Date(project.due_at.slice(0, 10))
+                    const now = new Date()
+                    now.setHours(0, 0, 0, 0)
+                    const diff = Math.ceil((due.getTime() - now.getTime()) / 86_400_000)
+                    const cls = diff <= 0 ? 'text-red-400' : diff <= 3 ? 'text-amber-400' : 'text-muted-foreground'
+                    const text = diff < 0 ? `已过期 ${-diff} 天` : diff === 0 ? '今天到期' : `还有 ${diff} 天`
+                    return (
+                      <>
+                        <span />
+                        <div className={`text-xs ${cls}`}>⏱ {text} · {weekdayCN(project.due_at)}</div>
+                      </>
+                    )
+                  })()}
                   <label className="text-muted-foreground">每 N 天提醒</label>
                   <input
                     key={`reminder-${project.id}`}
@@ -374,16 +459,6 @@ export function Inspector({ projectId, refreshSignal, onOpenMainAgent, onProject
                     className="bg-input border border-border rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-ring w-20"
                   />
                 </div>
-                {/* DDL countdown */}
-                {project.due_at && (() => {
-                  const due = new Date(project.due_at.slice(0, 10))
-                  const now = new Date()
-                  now.setHours(0, 0, 0, 0)
-                  const diff = Math.ceil((due.getTime() - now.getTime()) / 86_400_000)
-                  const cls = diff <= 0 ? 'text-red-400' : diff <= 3 ? 'text-amber-400' : 'text-muted-foreground'
-                  const text = diff < 0 ? `已过期 ${-diff} 天` : diff === 0 ? '今天到期' : `还有 ${diff} 天`
-                  return <div className={`text-xs ${cls} mt-1`}>⏱ {text}</div>
-                })()}
                 {/* Recurring task toggle */}
                 <div className="mt-3 space-y-1">
                   <Switch

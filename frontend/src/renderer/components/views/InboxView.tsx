@@ -1,15 +1,20 @@
 import { useState, useEffect, useCallback } from 'react'
 import type { TaskViewRow } from '../../../preload/index'
 import { TaskRow } from './TaskViewShared'
+import { ContextMenu, type MenuEntry } from '../ContextMenu'
+import { sendToMainAgent } from '../../lib/sendToMainAgent'
 
 interface InboxViewProps {
   refreshSignal: number
+  onSelectTask: (task: TaskViewRow) => void
   onJumpToTask: (task: TaskViewRow) => void
   onQuickAdd: () => void
+  selectedTaskId: number | null
 }
 
-export function InboxView({ refreshSignal, onJumpToTask, onQuickAdd }: InboxViewProps) {
+export function InboxView({ refreshSignal, onSelectTask, onJumpToTask, onQuickAdd, selectedTaskId }: InboxViewProps) {
   const [tasks, setTasks] = useState<TaskViewRow[]>([])
+  const [menu, setMenu] = useState<{ x: number; y: number; task: TaskViewRow } | null>(null)
 
   const load = useCallback(async () => {
     setTasks(await window.lineup.getInboxTasks())
@@ -39,19 +44,49 @@ export function InboxView({ refreshSignal, onJumpToTask, onQuickAdd }: InboxView
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-3 py-2">
-        {tasks.length === 0 ? (
-          <div className="text-center text-sm text-muted-foreground py-12">
-            收件箱是空的 —— ⌘N 快速添加一个任务
-          </div>
-        ) : (
-          <div className="space-y-0.5">
-            {tasks.map(t => (
-              <TaskRow key={t.id} task={t} onToggleDone={toggleDone} onJump={onJumpToTask} />
-            ))}
-          </div>
-        )}
+      <div className="flex-1 overflow-y-auto">
+        <div className="px-3 py-2">
+          {tasks.length === 0 ? (
+            <div className="text-center text-sm text-muted-foreground py-12">
+              收件箱是空的 —— ⌘N 快速添加一个任务
+            </div>
+          ) : (
+            <div className="space-y-0.5">
+              {tasks.map(t => (
+                <TaskRow
+                  key={t.id}
+                  task={t}
+                  onToggleDone={toggleDone}
+                  onSelect={onSelectTask}
+                  onJump={onJumpToTask}
+                  onContextMenu={(task, e) => setMenu({ x: e.clientX, y: e.clientY, task })}
+                  isSelected={selectedTaskId === t.id}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
+      {menu && (() => {
+        const t = menu.task
+        const entries: MenuEntry[] = [
+          {
+            label: '💬 发送给通用 agent 处理',
+            onClick: async () => {
+              setMenu(null)
+              const lines = [
+                `任务: ${t.name}`,
+                t.parent_name ? `所属项目: ${t.parent_name}` : '',
+                t.due_at ? `截止: ${t.due_at.slice(0, 10)}` : '',
+                t.reminder_every_days ? `每 ${t.reminder_every_days} 天提醒` : '',
+                t.progress_note ? `\n备注:\n${t.progress_note}` : '',
+              ].filter(Boolean)
+              await sendToMainAgent(lines.join('\n'))
+            },
+          },
+        ]
+        return <ContextMenu x={menu.x} y={menu.y} items={entries} onClose={() => setMenu(null)} />
+      })()}
     </div>
   )
 }

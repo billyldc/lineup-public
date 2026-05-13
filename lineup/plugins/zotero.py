@@ -105,6 +105,56 @@ def _row_to_item(row: sqlite3.Row) -> base.Item:
     )
 
 
+def resolve_item_storage_folder(item_key: str) -> Path | None:
+    """Given a Zotero item key, return a filesystem folder suitable for
+    running a claude agent in.
+
+    Priority:
+      1. If the item has a PDF attachment stored locally (linked or Zotero-
+         storage), return that attachment's storage folder
+         (~/Zotero/storage/<attachment-key>/). The PDF is inside, which
+         means `claude` running there can Read it directly.
+      2. Otherwise create and return ~/.lineup/zotero/<item-key>/ as a
+         scratch folder. The agent has a stable per-item cwd for notes
+         even without a PDF.
+
+    Returns None only if the Zotero DB is unavailable AND we can't create
+    the scratch folder.
+    """
+    conn = _get_db()
+    storage_key: str | None = None
+    if conn:
+        try:
+            # Find the first PDF-ish attachment for this item. Zotero
+            # attachments store their linkMode + contentType in itemAttachments.
+            row = conn.execute("""
+                SELECT att_item.key AS att_key, att.contentType AS mime
+                FROM items parent
+                JOIN itemAttachments att ON att.parentItemID = parent.itemID
+                JOIN items att_item ON att_item.itemID = att.itemID
+                WHERE parent.key = ?
+                  AND att_item.itemID NOT IN (SELECT itemID FROM deletedItems)
+                ORDER BY CASE att.contentType
+                  WHEN 'application/pdf' THEN 0
+                  ELSE 1 END
+                LIMIT 1
+            """, (item_key,)).fetchone()
+            if row and row["att_key"]:
+                storage_key = row["att_key"]
+        finally:
+            conn.close()
+
+    if storage_key:
+        folder = Path.home() / "Zotero" / "storage" / storage_key
+        if folder.exists():
+            return folder
+
+    # Fallback scratch folder — always succeeds.
+    scratch = Path.home() / ".lineup" / "zotero" / item_key
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
 def _collection_id_for_key(conn: sqlite3.Connection, key: str) -> int | None:
     row = conn.execute(
         "SELECT collectionID FROM collections WHERE key = ?",

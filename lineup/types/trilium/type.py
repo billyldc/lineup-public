@@ -20,10 +20,10 @@ from lineup.types import register
 from lineup.types.base import ObjectType
 
 
-# TriliumNext server address. Override via ~/.lineup/config.json if
-# your server runs on a different host/port. The web UI supports
-# direct note navigation via URL hash (#/notes/<noteId>).
-TRILIUM_SERVER = "http://localhost:37840"
+# TriliumNext server address. When running on a remote Mac Mini,
+# use its IP. The web UI at this address supports direct note
+# navigation via URL hash (#/notes/<noteId>).
+TRILIUM_SERVER = "http://100.108.137.82:37840"
 
 TRILIUM_DATA = Path.home() / "Library" / "Application Support" / "trilium-data"
 TRILIUM_DB = TRILIUM_DATA / "document.db"

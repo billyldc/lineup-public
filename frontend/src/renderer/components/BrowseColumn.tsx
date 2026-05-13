@@ -10,6 +10,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { BrowseItem, Agent } from '../../preload/index'
 import { setObjectDragData } from '../lib/drag'
+import { ContextMenu, type MenuEntry } from './ContextMenu'
 
 const DEFAULT_BROWSE_WIDTH = 288
 const MIN_BROWSE_WIDTH = 200
@@ -25,6 +26,7 @@ function loadBrowseWidth(source: string, target: string): number {
 const typeLabels: Record<string, string> = {
   file: '文件', folder: '文件夹', url: '链接', zotero: '文献',
   trilium: '笔记', obsidian: '笔记', script: '脚本',
+  mail: '邮件', contact: '联系人',
 }
 
 export type BrowseSource = 'obsidian' | 'trilium' | 'fs' | 'zotero'
@@ -68,8 +70,39 @@ export function BrowseColumn({ source, target, label, selectedChildId, onSelectC
   const [loading, setLoading] = useState(false)
   const [agents, setAgents] = useState<Agent[]>([])
   const [width, setWidth] = useState<number>(() => loadBrowseWidth(source, target))
+  // Right-click menu position + target item
+  const [menu, setMenu] = useState<{ x: number; y: number; item: BrowseItem } | null>(null)
   const dragStartX = useRef<number | null>(null)
   const dragStartWidth = useRef<number>(0)
+
+  // Lineup "type" used by openTarget for this source. Matches the mapping
+  // the drag-start / double-click handlers already use.
+  const lineupTypeFor = useCallback((item: BrowseItem): string => {
+    if (source === 'trilium') return 'trilium'
+    if (source === 'obsidian') return 'obsidian'
+    if (source === 'zotero') return 'zotero'
+    return item.type  // fs → file | folder
+  }, [source])
+
+  // Is there a real filesystem path behind this child? (Only those can
+  // be "revealed in Finder".) fs targets are paths; obsidian targets are
+  // absolute paths inside a vault; zotero/trilium targets are URIs.
+  const finderPathFor = useCallback((item: BrowseItem): string | null => {
+    if (source === 'fs' || source === 'obsidian') {
+      // Defensive: ensure it's an absolute path, not a URL scheme.
+      if (item.target && item.target.startsWith('/')) return item.target
+    }
+    return null
+  }, [source])
+
+  const sourceOpenLabel = useCallback((item: BrowseItem): string => {
+    if (source === 'trilium') return '在 Trilium 中打开'
+    if (source === 'obsidian') return '在 Obsidian 中打开'
+    if (source === 'zotero') return '在 Zotero 中打开'
+    // fs — directory → Finder; file → default app
+    if (item.type === 'folder') return '在 Finder 中打开'
+    return '用默认应用打开'
+  }, [source])
 
   useEffect(() => { setWidth(loadBrowseWidth(source, target)) }, [source, target])
   useEffect(() => {
@@ -202,6 +235,11 @@ export function BrowseColumn({ source, target, label, selectedChildId, onSelectC
                     : item.type
                   await window.lineup.openTarget(lineupType, item.target)
                 }}
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  setMenu({ x: e.clientX, y: e.clientY, item })
+                }}
                 className={`w-full text-left px-3 py-2 flex items-center gap-2 text-sm transition-colors
                   ${isSelected
                     ? 'bg-primary text-primary-foreground'
@@ -230,6 +268,68 @@ export function BrowseColumn({ source, target, label, selectedChildId, onSelectC
           })
         )}
       </div>
+      {menu && (() => {
+        const item = menu.item
+        const finderPath = finderPathFor(item)
+        const entries: MenuEntry[] = [
+          {
+            label: sourceOpenLabel(item),
+            onClick: () => {
+              window.lineup.openTarget(lineupTypeFor(item), item.target)
+              setMenu(null)
+            },
+          },
+        ]
+        if (finderPath) {
+          entries.push({
+            label: '在 Finder 中显示',
+            onClick: () => {
+              window.lineup.revealInFinder(finderPath)
+              setMenu(null)
+            },
+          })
+        }
+        // Zotero items only: offer to open (or create) an item-anchored
+        // agent. The agent runs in the item's PDF storage folder so claude
+        // can Read the paper directly and the conversation persists
+        // per-item in ~/.claude/projects/<folder-hash>/.
+        const isZoteroItem = source === 'zotero'
+          && !isDirectory(item, source)
+          && item.target.startsWith('zotero://select/library/items/')
+        if (isZoteroItem) {
+          const zoteroKey = item.target.split('/').pop() || ''
+          entries.push({
+            label: '💬 打开论文 agent',
+            onClick: async () => {
+              setMenu(null)
+              // Look up existing agent for this item; if none, create one.
+              const existing = await window.lineup.listAgentsForZotero(zoteroKey)
+              let agent = existing[0]
+              if (!agent) {
+                const r = await window.lineup.createAgentForZotero({
+                  zoteroKey,
+                  name: item.name,
+                })
+                if (!r.ok) {
+                  alert(r.error || '创建失败')
+                  return
+                }
+                const refreshed = await window.lineup.listAgentsForZotero(zoteroKey)
+                agent = refreshed[0]
+              }
+              if (agent) onOpenAgent?.(agent)
+            },
+          })
+        }
+        return (
+          <ContextMenu
+            x={menu.x}
+            y={menu.y}
+            items={entries}
+            onClose={() => setMenu(null)}
+          />
+        )
+      })()}
     </div>
   )
 }

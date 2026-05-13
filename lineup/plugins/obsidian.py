@@ -36,56 +36,56 @@ class ObsidianPlugin(base.Plugin):
         return notes
 
     def search(self, query: str, limit: int = 10) -> list[base.Item]:
-        """Search notes by filename and content."""
+        """Search notes by filename/path (fuzzy).
+
+        Fuzzy matching works like Alfred / VSCode / Sublime: the query
+        characters must appear in the candidate in order, not necessarily
+        contiguous. "fcs26" matches "FOCS26-paper221".
+
+        Content search is intentionally NOT done here: vaults with thousands
+        of notes would trigger thousands of synchronous file reads, hanging
+        the MCP call. Users who want content search can use Obsidian's own
+        full-text search.
+        """
+        from lineup.plugins._fuzzy import fuzzy_score
+
         query_lower = query.lower()
-        results: list[tuple[int, base.Item]] = []
+        scored: list[tuple[int, Path]] = []
 
         for note in self._all_notes():
-            score = 0
-            name = note.stem
             rel = str(note.relative_to(self._vault_of(note)))
-
-            # filename match (higher weight)
-            if query_lower in name.lower():
-                score += 10
-
-            # path match
-            if query_lower in rel.lower():
-                score += 5
-
-            # content match
-            if score == 0:
-                try:
-                    content = note.read_text(errors="ignore")[:5000]
-                    if query_lower in content.lower():
-                        score += 1
-                except OSError:
-                    continue
-
+            name_score = fuzzy_score(query_lower, note.stem.lower())
+            rel_score = fuzzy_score(query_lower, rel.lower())
+            score = max(name_score * 10, rel_score * 5)
             if score > 0:
-                # read first line as preview
-                preview = ""
-                try:
-                    with open(note, "r", errors="ignore") as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith("---"):
-                                preview = line[:100]
-                                break
-                except OSError:
-                    pass
+                scored.append((score, note))
 
-                results.append((score, base.Item(
-                    id=str(note),
-                    name=name,
-                    target=str(note),
-                    type="file",
-                    default_app="Obsidian",
-                    preview=preview,
-                )))
+        scored.sort(key=lambda x: -x[0])
+        top = scored[:limit]
 
-        results.sort(key=lambda x: -x[0])
-        return [item for _, item in results[:limit]]
+        # Read first-line preview only for the top-N final results — not for
+        # every fuzzy match (can be hundreds) or every note (can be thousands).
+        results: list[base.Item] = []
+        for score, note in top:
+            preview = ""
+            try:
+                with open(note, "r", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("---"):
+                            preview = line[:100]
+                            break
+            except OSError:
+                pass
+            results.append(base.Item(
+                id=str(note),
+                name=note.stem,
+                target=str(note),
+                type="obsidian",
+                default_app="Obsidian",
+                preview=preview,
+            ))
+        return results
 
     def read(self, item_id: str) -> str:
         """Read a note's content."""
@@ -140,8 +140,17 @@ class ObsidianPlugin(base.Plugin):
                             id=str(entry),
                             name=entry.stem,
                             target=str(entry),
-                            type="file",
+                            type="obsidian",
                             default_app="Obsidian",
+                        ))
+                    elif entry.suffix.lower() == ".pdf":
+                        # PDFs can live inside obsidian vaults too. Show them
+                        # as file type (default app), not obsidian.
+                        items.append(base.Item(
+                            id=str(entry),
+                            name=entry.name,
+                            target=str(entry),
+                            type="file",
                         ))
             return items
 
@@ -165,9 +174,16 @@ class ObsidianPlugin(base.Plugin):
                     id=str(entry),
                     name=entry.stem,
                     target=str(entry),
-                    type="file",
+                    type="obsidian",
                     default_app="Obsidian",
-                    ))
+                ))
+            elif entry.suffix.lower() == ".pdf":
+                items.append(base.Item(
+                    id=str(entry),
+                    name=entry.name,
+                    target=str(entry),
+                    type="file",
+                ))
         return items
 
     def list_vaults(self) -> list[dict]:

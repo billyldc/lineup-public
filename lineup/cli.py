@@ -65,6 +65,67 @@ def init():
 
 
 @cli.command()
+def doctor():
+    """Audit the DB for ghost rows: orphan projects/tasks/steps that are
+    invisible in the lineup Electron sidebar (which only renders root
+    projects with type IN (NULL, 'project') and not archived).
+
+    Prints a report; does NOT mutate. Use `lu list --type document` for
+    the doc subset, and direct SQL for cleanup."""
+    conn = store.get_db()
+    try:
+        rows = conn.execute("""
+            SELECT id, name, type, status, archived, is_inbox,
+                   (SELECT COUNT(*) FROM project_parents pp WHERE pp.project_id = projects.id) AS parents,
+                   (SELECT COUNT(*) FROM project_parents pp WHERE pp.parent_id = projects.id) AS kids,
+                   (SELECT COUNT(*) FROM objects o WHERE o.project_id = projects.id) AS objs
+            FROM projects
+            WHERE NOT EXISTS (SELECT 1 FROM project_parents pp WHERE pp.project_id = projects.id)
+              AND (is_inbox = 0 OR is_inbox IS NULL)
+              AND NOT (
+                (type IS NULL OR type = 'project')
+                AND (archived IS NULL OR archived = 0)
+              )
+            ORDER BY type, id
+        """).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        click.echo("✓ 没有发现幽灵根项目")
+    else:
+        click.echo(f"⚠ 发现 {len(rows)} 个幽灵根项目（侧边栏看不见，但行还在数据库里）：\n")
+        click.echo(f"  {'id':>4}  {'type':<10} {'name':<40} kids  objs  archived")
+        for r in rows:
+            click.echo(
+                f"  {r['id']:>4}  {(r['type'] or '?'):<10} {r['name'][:38]:<40} "
+                f"{r['kids']:>4}  {r['objs']:>4}  {r['archived']}"
+            )
+        click.echo("\n处理建议：")
+        click.echo("  - type='document' 想救 → UPDATE projects SET type='project' WHERE id=...")
+        click.echo("  - 真要删 → DELETE FROM project_parents ...; DELETE FROM projects WHERE id=...")
+
+    # Also surface orphan task/step rows (rows whose immediate parent
+    # disappeared — possible from older deleteProject implementations).
+    conn2 = store.get_db()
+    try:
+        orphans = conn2.execute("""
+            SELECT id, name, type, status
+            FROM projects
+            WHERE type IN ('task', 'step')
+              AND NOT EXISTS (SELECT 1 FROM project_parents pp WHERE pp.project_id = projects.id)
+            ORDER BY type, id
+        """).fetchall()
+    finally:
+        conn2.close()
+
+    if orphans:
+        click.echo(f"\n⚠ 还有 {len(orphans)} 个无父的 task/step（应该归属某个 project/task）：")
+        for o in orphans:
+            click.echo(f"  #{o['id']} [{o['type']}] {o['name'][:60]}")
+
+
+@cli.command()
 def ui():
     """Launch the Textual TUI."""
     try:
@@ -137,6 +198,22 @@ def browse_zotero(path):
     click.echo(_items_to_json(zot.browse(path)))
 
 
+@browse_group.command("mail")
+@click.argument("path", required=False, default="")
+def browse_mail(path):
+    """List Apple Mail accounts / inbox messages.
+
+    PATH empty    → list accounts as folders + 30 most recent unified inbox
+    PATH account: → list 50 most recent from that account
+    """
+    import json
+    m = plugins.get("mail")
+    if m is None:
+        click.echo(json.dumps({"error": "mail plugin not loaded"}))
+        return
+    click.echo(_items_to_json(m.browse(path)))
+
+
 # ── Search (JSON output for frontend) ──────────────────────────────────────
 
 
@@ -184,7 +261,104 @@ def search_zotero(query, limit):
     click.echo(_items_to_json(zot.search(query, limit=limit)))
 
 
-# ── Types ──────────────────────────────────────────────────────────────────
+@search_group.command("mail")
+@click.argument("query")
+@click.option("--limit", default=20, help="Max results")
+def search_mail(query, limit):
+    """Search Apple Mail inbox by subject/sender substring."""
+    import json
+    m = plugins.get("mail")
+    if m is None:
+        click.echo(json.dumps({"error": "mail plugin not loaded"}))
+        return
+    click.echo(_items_to_json(m.search(query, limit=limit)))
+
+
+@cli.group("mail")
+def mail_group():
+    """Apple Mail cache commands."""
+
+
+@mail_group.command("resolve")
+@click.argument("target")
+def mail_resolve(target):
+    """Resolve mailrow:<N> to message://<encoded-MID>, or pass through
+    existing message:// URLs. Prints the canonical URL on stdout; prints
+    nothing + exits non-zero if the rowid can't be resolved.
+
+    Used by the Electron shell:openTarget IPC handler so clicking 🔗 原文
+    on an email item opens Mail.app at the right message.
+    """
+    from lineup.plugins.mail import MailPlugin
+    r = MailPlugin().resolve_target(target)
+    if not r:
+        import sys
+        sys.exit(1)
+    click.echo(r)
+
+
+@mail_group.command("save-attachment")
+@click.argument("target")
+@click.argument("index", type=int)
+@click.argument("dest_dir", type=click.Path(file_okay=False, path_type=__import__("pathlib").Path))
+def mail_save_attachment(target, index, dest_dir):
+    """Save attachment #INDEX from email TARGET to DEST_DIR. Prints JSON
+    {ok, path, name, size} or {error}."""
+    import json
+    from lineup.plugins.mail import MailPlugin
+    r = MailPlugin().save_attachment(target, index, dest_dir)
+    click.echo(json.dumps(r, ensure_ascii=False))
+
+
+@mail_group.command("preview")
+@click.argument("item_id")
+def mail_preview(item_id):
+    """Preview a single email by ROWID or message:// URL — JSON output."""
+    import json as _json
+    m = plugins.get("mail")
+    if m is None:
+        click.echo(_json.dumps({"error": "mail plugin not loaded"}))
+        return
+    result = m.preview(item_id)
+    click.echo(_json.dumps(result, ensure_ascii=False))
+
+
+@mail_group.command("sync")
+@click.option("--limit", default=200, help="Per-account message count to pull")
+@click.option("--account", default=None, help="Sync one specific account name only")
+def mail_sync(limit, account):
+    """Refresh the local Mail cache (SQLite) from Mail.app via JXA.
+
+    Slow first run; prints progress. Subsequent browses/searches read from
+    the cache and are instant.
+    """
+    import json
+    from lineup.plugins import mail as mail_plugin
+    result = mail_plugin.sync(per_account_limit=limit, account=account, verbose=True)
+    click.echo(json.dumps(result, ensure_ascii=False))
+
+
+@cli.group("zotero")
+def zotero_group():
+    """Zotero-specific helpers (resolve storage paths, open agents, etc.)."""
+
+
+@zotero_group.command("resolve")
+@click.argument("item_key")
+def zotero_resolve(item_key):
+    """Print the filesystem folder suitable for a per-item agent.
+
+    Tries to find the item's local PDF storage (~/Zotero/storage/<attach>/);
+    falls back to a lineup scratch dir ~/.lineup/zotero/<item-key>/. Used
+    by the Electron UI when the user asks to open an agent for a Zotero
+    entry.
+    """
+    from lineup.plugins.zotero import resolve_item_storage_folder
+    folder = resolve_item_storage_folder(item_key)
+    if not folder:
+        import sys
+        sys.exit(1)
+    click.echo(str(folder))
 
 
 @cli.group("types")
@@ -575,10 +749,14 @@ def show():
 @click.argument("name", nargs=-1, required=True)
 @click.option("-a", "--app", default=None, help="指定应用打开")
 @click.option("-p", "--project", default=None, help="指定项目（否则用当前活跃项目）")
-def open_cmd(name, app, project):
+@click.option("--via", default="system",
+              type=click.Choice(["system", "managed"]),
+              help="对 URL 类对象：system=系统默认浏览器（用户双击默认），"
+                   "managed=lineup-managed Chrome tab group（agent / MCP 默认）")
+def open_cmd(name, app, project, via):
     """Open a linked object."""
     name = " ".join(name)
-    result = store.open_object(name, app, project=project)
+    result = store.open_object(name, app, project=project, via=via)
     if "错误" in result:
         click.echo(styled_err(result))
     else:

@@ -5,11 +5,20 @@ import { PROJECT_COLORS } from '../Inspector'
 export function TaskRow({
   task,
   onToggleDone,
+  onSelect,
   onJump,
+  onContextMenu,
+  isSelected,
 }: {
   task: TaskViewRow
   onToggleDone: (task: TaskViewRow) => void
+  /** Single-click = select; Inspector shows task detail, view doesn't change */
+  onSelect: (task: TaskViewRow) => void
+  /** Double-click = navigate to the task's column in the Miller view */
   onJump: (task: TaskViewRow) => void
+  /** Right-click — parent decides what menu to show (e.g. 发送给通用 agent). */
+  onContextMenu?: (task: TaskViewRow, e: React.MouseEvent) => void
+  isSelected?: boolean
 }) {
   const isDone = task.status === 'done'
   const color = task.parent_color && PROJECT_COLORS[task.parent_color]
@@ -18,8 +27,13 @@ export function TaskRow({
 
   return (
     <div
-      className={`group flex items-start gap-2 px-3 py-2 rounded hover:bg-accent/40 cursor-pointer ${isDone ? 'opacity-60' : ''}`}
-      onClick={() => onJump(task)}
+      className={`group flex items-start gap-2 px-3 py-2 rounded cursor-pointer transition-colors
+        ${isSelected ? 'bg-accent' : 'hover:bg-accent/40'}
+        ${isDone ? 'opacity-60' : ''}`}
+      onClick={() => onSelect(task)}
+      onDoubleClick={() => onJump(task)}
+      onContextMenu={onContextMenu ? (e) => { e.preventDefault(); onContextMenu(task, e) } : undefined}
+      title="单击选中 · 双击进入项目列视图 · 右键菜单"
     >
       <button
         onClick={(e) => { e.stopPropagation(); onToggleDone(task) }}
@@ -31,7 +45,19 @@ export function TaskRow({
 
       <div className="min-w-0 flex-1">
         <div className={`text-sm break-all ${isDone ? 'line-through' : ''}`}>
-          {task.name}
+          {/* Step rows inline their parent task's name here because step
+              labels are often vague ("问一下 X") and need task context
+              ("项目 ▸ 问一下 X") to be readable at a glance. Pure
+              task rows render just the task name as before. */}
+          {task.task_name ? (
+            <>
+              <span className="opacity-90">{task.task_name}</span>
+              <span className="opacity-60 mx-1">▸</span>
+              <span>{task.name}</span>
+            </>
+          ) : (
+            task.name
+          )}
         </div>
         <div className="flex items-center gap-2 mt-0.5 text-[11px] text-muted-foreground">
           {task.parent_name ? (

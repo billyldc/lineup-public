@@ -82,8 +82,10 @@ CREATE TABLE IF NOT EXISTS projects (
     color TEXT,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
+    -- Exactly one row has is_inbox = 1: the reserved "收件箱" project
+    -- that holds all quick-added / orphan tasks. This row cannot be deleted.
+    is_inbox INTEGER NOT NULL DEFAULT 0,
     -- Recurring tasks: when completed, auto-reset after N days.
-    -- Steps under this task are also reset. null = not recurring.
     recurring_days INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
 );
@@ -138,12 +140,14 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project_id);
 CREATE INDEX IF NOT EXISTS idx_agents_folder ON agents(folder_path);
+
 """
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -200,6 +204,9 @@ def init_db() -> str:
         "ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE projects ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE projects ADD COLUMN recurring_days INTEGER",
+        "ALTER TABLE projects ADD COLUMN is_inbox INTEGER NOT NULL DEFAULT 0",
+        # 2026-05-03: completion timestamp for the status-flip-to-done event.
+        "ALTER TABLE projects ADD COLUMN completed_at TEXT",
     ]:
         try:
             conn.execute(stmt)
@@ -223,15 +230,32 @@ def init_db() -> str:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_folder ON agents(folder_path)")
+    # Zotero item anchoring — an agent can be attached to a specific Zotero
+    # item (e.g. "this paper's discussion log"). folder_path is ALSO set on
+    # such rows (pointing at the item's storage folder or a scratch dir),
+    # so the existing XOR check on project_id/folder_path still holds.
+    # zotero_key is just an extra tag.
+    try: conn.execute("ALTER TABLE agents ADD COLUMN zotero_key TEXT")
+    except Exception: pass
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agents_zotero ON agents(zotero_key)")
+    try: conn.execute("ALTER TABLE contacts ADD COLUMN last_message_at TEXT")
+    except Exception: pass
 
     # Migration: re-detect object types using the type registry.
     # Objects linked before the type system existed may have generic types
     # (file/folder) that should be more specific (obsidian/trilium/url/etc).
+    # Skip rows whose current type is "opt-in only" (priority == 0) — those
+    # types were deliberately assigned by the user (e.g. chrome_tab on a
+    # plain http URL) and must not be overwritten by a higher-priority
+    # auto-match.
     try:
         from lineup import types
         types.load_all()
         objs = conn.execute("SELECT id, target, type FROM objects").fetchall()
         for obj in objs:
+            current = types.get_by_name(obj["type"])
+            if current is not None and current.priority == 0:
+                continue
             detected = types.get_for_target(obj["target"])
             if detected.name != obj["type"] and detected.priority > 0:
                 conn.execute(
@@ -273,6 +297,15 @@ def _resolve_parent_by_name(conn, parent_name: str):
 
 
 def create_project(name: str, description: str = "", priority: int = 3, parent: str | None = None, type: str = "project") -> str:
+    # Whitelist the type so the only way to land an unknown / typo'd
+    # value in projects.type is through a deliberate raw SQL write. This
+    # closes the loop on the "ghost" issue: unknown types previously
+    # passed through and the row became invisible in the Electron sidebar
+    # (which only renders type IN (NULL, 'project')) but visible to AI
+    # triage — see _load_projects in lineup/inbox/agent.py for the
+    # corresponding read-side filter.
+    if type not in ('project', 'task', 'step', 'document'):
+        return f"错误：未知 type={type!r}，只能是 project / task / step / document"
     conn = get_db()
     try:
         # Check duplicate name — and be helpful about it
@@ -394,10 +427,25 @@ def create_step(name: str, parent_task: str) -> str:
             (parent_row['id'],),
         ).fetchone()
         order_index = (max_row['mx'] or 0) + 1
+        # Inherit due_at / reminder_every_days / important / urgent from the
+        # parent task so steps automatically land in Today/Eisenhower when
+        # the task would. `recurring_days` is explicitly NOT inherited — it
+        # describes a specific item, not a lineage.
+        parent_full = conn.execute(
+            """SELECT due_at, reminder_every_days, important, urgent
+               FROM projects WHERE id = ?""",
+            (parent_row['id'],),
+        ).fetchone()
         conn.execute(
-            """INSERT INTO projects (name, type, priority, order_index)
-               VALUES (?, 'step', 3, ?)""",
-            (name, order_index),
+            """INSERT INTO projects
+                 (name, type, priority, order_index,
+                  due_at, reminder_every_days, important, urgent)
+               VALUES (?, 'step', 3, ?, ?, ?, ?, ?)""",
+            (name, order_index,
+             parent_full['due_at'] if parent_full else None,
+             parent_full['reminder_every_days'] if parent_full else None,
+             parent_full['important'] if parent_full else 0,
+             parent_full['urgent'] if parent_full else 0),
         )
         child_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute(
@@ -737,40 +785,136 @@ def set_priority(priority: int, project: str | None = None) -> str:
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
     conn = get_db()
     try:
         conn.execute("UPDATE projects SET priority = ? WHERE id = ?", (priority, project_id))
         conn.commit()
-        return f"已更新 \"{project_name}\" 优先级：{priority}"
+        return _resolve_warn + (f"已更新 \"{project_name}\" 优先级：{priority}")
     finally:
         conn.close()
 
 
-def _resolve_project(project: str | None) -> tuple[int, str] | str:
-    """Resolve project by name, or fall back to active context. Returns (id, name) or error string."""
+def _resolve_project_from_cwd(conn, cwd_override: str | None = None) -> tuple[int, str] | None:
+    """Try to derive the current project from cwd.
+
+    cwd_override: explicit cwd string (used by MCP tools — the server
+        process's cwd is unrelated to the agent's actual location, so
+        the caller must forward agent.cwd via tool args).
+
+    Two patterns, in priority order:
+      (a) cwd is under ~/.lineup/projects/<chain>/<projectname>/ — Plan C
+          virtual layout pins each project main agent to its own nested
+          directory whose LAST segment is exactly the project name.
+      (b) cwd equals an objects.target row of type='folder' — i.e. an
+          ad-hoc agent running in a real folder that's linked to a
+          project. Take the most-recently-linked owner if multiple.
+
+    Returns (project_id, project_name) on hit, None on miss.
+    """
+    try:
+        if cwd_override:
+            cwd = Path(cwd_override).expanduser().resolve()
+        else:
+            cwd = Path.cwd().resolve()
+    except (OSError, RuntimeError):
+        return None
+
+    # (a) Virtual project directory
+    virtual_root = (Path.home() / ".lineup" / "projects").resolve()
+    rel = None
+    try:
+        rel = cwd.relative_to(virtual_root)
+    except ValueError:
+        pass
+    if rel is not None and rel.parts:
+        candidate_name = rel.parts[-1]
+        row = conn.execute(
+            "SELECT id, name FROM projects WHERE name = ?", (candidate_name,)
+        ).fetchone()
+        if row:
+            return (row["id"], row["name"])
+
+    # (b) Linked external folder
+    row = conn.execute(
+        "SELECT p.id, p.name FROM objects o "
+        "JOIN projects p ON p.id = o.project_id "
+        "WHERE o.type = 'folder' AND o.target = ? "
+        "ORDER BY o.id DESC LIMIT 1",
+        (str(cwd),),
+    ).fetchone()
+    if row:
+        return (row["id"], row["name"])
+
+    return None
+
+
+def _resolve_project(
+    project: str | None, cwd_override: str | None = None,
+) -> tuple[int, str, str] | str:
+    """Resolve a project to (id, name, warning) or return an error string.
+
+    cwd_override: explicit cwd from caller (MCP tools should pass agent.cwd
+        via tool args — server process cwd is unrelated to agent's location).
+
+    Resolution priority:
+      1. Explicit `project` argument — authoritative, no warning.
+      2. cwd-derived (virtual or linked folder) — strong signal of intent
+         from where the agent is running, no warning.
+      3. get_active_context() fallback — warning string explaining the
+         fallback so the caller can prepend it to its output. This is the
+         layer that USED to silently mis-link when an agent's cwd didn't
+         match the TUI's last-opened project.
+    """
     conn = get_db()
     try:
         if project:
             row = conn.execute("SELECT id, name FROM projects WHERE name = ?", (project,)).fetchone()
             if not row:
                 return f"错误：项目 \"{project}\" 不存在"
-            return (row["id"], row["name"])
+            return (row["id"], row["name"], "")
+
+        # cwd first — strongest signal.
+        from_cwd = _resolve_project_from_cwd(conn, cwd_override=cwd_override)
+        if from_cwd:
+            return (from_cwd[0], from_cwd[1], "")
+
+        # Active-context fallback. Loud warning so the caller can prepend
+        # it to the success message — the previous silent fallback was
+        # the root cause of agents mis-linking objects to whichever
+        # project the TUI happened to have open.
+        cur = get_active_context()
+        if not cur:
+            return (
+                "错误：未指定项目，cwd 不在任何已注册项目下，也没有当前活跃项目。"
+                "请用 --project 显式指定"
+            )
+        if cwd_override:
+            cwd_str = cwd_override
         else:
-            cur = get_active_context()
-            if not cur:
-                return "错误：未指定项目，也没有当前活跃项目。请先用 cd 进入一个项目或文档"
-            return (cur["id"], cur["name"])
+            try:
+                cwd_str = os.getcwd()
+            except OSError:
+                cwd_str = "(unknown)"
+        warning = (
+            f"⚠ 未指定 --project 且 cwd ({cwd_str}) 不在任何已注册项目下；"
+            f"兜底使用活跃项目 \"{cur['name']}\"。如非本意请显式传 --project。\n"
+        )
+        # Defense in depth: also surface to stderr so the warning is
+        # visible even if a caller forgets to prepend it to the output.
+        import sys
+        print(warning.rstrip(), file=sys.stderr)
+        return (cur["id"], cur["name"], warning)
     finally:
         conn.close()
 
 
-def link_object(target: str, name: str, type: str = "file", project: str | None = None, default_app: str | None = None) -> str:
+def link_object(target: str, name: str, type: str = "file", project: str | None = None, default_app: str | None = None, cwd: str | None = None) -> str:
     """Link an object (file/folder/URL/zotero/script) to a project."""
-    resolved = _resolve_project(project)
+    resolved = _resolve_project(project, cwd_override=cwd)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     # Expand ~ in file paths
     if type in ("file", "folder", "script") and target.startswith("~"):
@@ -806,7 +950,7 @@ def link_object(target: str, name: str, type: str = "file", project: str | None 
         msg = f"已将 \"{name}\" ({type}) 链接到项目 \"{project_name}\"\n目标：{target}"
         if default_app:
             msg += f"\n默认应用：{default_app}"
-        return msg
+        return _resolve_warn + (msg)
     finally:
         conn.close()
 
@@ -816,7 +960,7 @@ def list_objects(project: str | None = None) -> str:
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -825,7 +969,7 @@ def list_objects(project: str | None = None) -> str:
             (project_id,),
         ).fetchall()
         if not objs:
-            return f"项目 \"{project_name}\" 中暂无链接对象"
+            return _resolve_warn + (f"项目 \"{project_name}\" 中暂无链接对象")
 
         lines = [f"项目 \"{project_name}\" 的对象："]
         for o in objs:
@@ -834,17 +978,30 @@ def list_objects(project: str | None = None) -> str:
                 type_label += f"/{o['default_app']}"
             line = f"  {o['name']}  {pretty_target(o['target'])}  [{type_label}]  (打开 {o['open_count']} 次)"
             lines.append(line)
-        return "\n".join(lines)
+        return _resolve_warn + ("\n".join(lines))
     finally:
         conn.close()
 
 
-def open_object(name: str, app: str | None = None, project: str | None = None) -> str:
-    """Open an object with the default or specified application. Increments open count."""
+def open_object(
+    name: str, app: str | None = None, project: str | None = None,
+    *, via: str = "system",
+) -> str:
+    """Open an object with the default or specified application. Increments open count.
+
+    `via` controls the routing for URL targets:
+      - "system" (default): hand to OS via `open <url>` → user's Chrome.
+        Used by the desktop UI's double-click path.
+      - "managed": post an attach message to the lineup Chrome bridge
+        so the URL lands in the lineup-managed tab group. Used by the
+        agent's MCP open path. Falls back to system on bridge failure.
+
+    Non-URL targets ignore `via` and use the type's normal open command.
+    """
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -893,9 +1050,9 @@ def open_object(name: str, app: str | None = None, project: str | None = None) -
         if type_cmd:
             try:
                 subprocess.Popen(type_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return f"已打开 \"{name}\"：{pretty_target(target)}"
+                return _resolve_warn + (f"已打开 \"{name}\"：{pretty_target(target)}")
             except Exception as e:
-                return f"打开失败：{e}"
+                return _resolve_warn + (f"打开失败：{e}")
 
         # 2. Fallback: plugin open command (legacy — obsidian/trilium until Phase 2)
         plugin_cmd = None
@@ -909,9 +1066,9 @@ def open_object(name: str, app: str | None = None, project: str | None = None) -
         if plugin_cmd:
             try:
                 subprocess.run(plugin_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return f"已打开 \"{name}\"：{pretty_target(target)}"
+                return _resolve_warn + (f"已打开 \"{name}\"：{pretty_target(target)}")
             except Exception as e:
-                return f"打开失败：{e}"
+                return _resolve_warn + (f"打开失败：{e}")
 
         # 3. Fallback: ask plugins for default app, then macOS open
         effective_app = app or obj["default_app"]
@@ -927,9 +1084,9 @@ def open_object(name: str, app: str | None = None, project: str | None = None) -
                 subprocess.Popen(["open", "-a", effective_app, target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 subprocess.Popen(["open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return f"已打开 \"{name}\"：{pretty_target(target)}" + (f"（使用 {effective_app}）" if effective_app else "")
+            return _resolve_warn + (f"已打开 \"{name}\"：{pretty_target(target)}" + (f"（使用 {effective_app}）" if effective_app else ""))
         except Exception as e:
-            return f"打开失败：{e}"
+            return _resolve_warn + (f"打开失败：{e}")
     finally:
         conn.close()
 
@@ -964,7 +1121,7 @@ def remove_object(name: str, project: str | None = None) -> str:
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -977,7 +1134,7 @@ def remove_object(name: str, project: str | None = None) -> str:
 
         conn.execute("DELETE FROM objects WHERE id = ?", (obj["id"],))
         conn.commit()
-        return f"已从项目 \"{project_name}\" 中移除 \"{name}\"（源文件未删除）"
+        return _resolve_warn + (f"已从项目 \"{project_name}\" 中移除 \"{name}\"（源文件未删除）")
     finally:
         conn.close()
 
@@ -989,7 +1146,7 @@ def todo_add(text: str, due_date: str | None = None, remind_date: str | None = N
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -1003,7 +1160,7 @@ def todo_add(text: str, due_date: str | None = None, remind_date: str | None = N
             msg += f"\n截止日期：{due_date}"
         if remind_date:
             msg += f"\n提醒日期：{remind_date}"
-        return msg
+        return _resolve_warn + (msg)
     finally:
         conn.close()
 
@@ -1013,7 +1170,7 @@ def todo_done(text: str, project: str | None = None) -> str:
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -1042,7 +1199,7 @@ def todo_done(text: str, project: str | None = None) -> str:
 
         conn.execute("UPDATE todos SET done = 1 WHERE id = ?", (todo["id"],))
         conn.commit()
-        return f"已完成：\"{todo['text']}\""
+        return _resolve_warn + (f"已完成：\"{todo['text']}\"")
     finally:
         conn.close()
 
@@ -1067,7 +1224,7 @@ def todo_list(project: str | None = None, show_done: bool = False) -> str:
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -1106,8 +1263,8 @@ def todo_list(project: str | None = None, show_done: bool = False) -> str:
         format_todos(project_id, project_name)
 
         if not lines:
-            return f"项目 \"{project_name}\" 暂无待办事项"
-        return "\n".join(lines)
+            return _resolve_warn + (f"项目 \"{project_name}\" 暂无待办事项")
+        return _resolve_warn + ("\n".join(lines))
     finally:
         conn.close()
 
@@ -1138,17 +1295,18 @@ def calendar_view(month: str | None = None, project: str | None = None) -> str:
     conn = get_db()
     try:
         # Determine which projects to include
+        _resolve_warn = ""  # init in case the str-branch below fires
         resolved = _resolve_project(project)
         if isinstance(resolved, str):
             # No current project - show all projects
             all_ids = [r["id"] for r in conn.execute("SELECT id FROM projects").fetchall()]
             project_name = "所有项目"
         else:
-            project_id, project_name = resolved
+            project_id, project_name, _resolve_warn = resolved
             all_ids = [project_id] + _get_all_descendant_ids(conn, project_id)
 
         if not all_ids:
-            return "暂无项目"
+            return _resolve_warn + ("暂无项目")
 
         # Get all todos with due dates in this month
         month_prefix = f"{year:04d}-{mon:02d}"
@@ -1204,7 +1362,7 @@ def calendar_view(month: str | None = None, project: str | None = None) -> str:
             lines.append("")
             lines.extend(event_lines)
 
-        return "\n".join(lines)
+        return _resolve_warn + ("\n".join(lines))
     finally:
         conn.close()
 
@@ -1221,7 +1379,7 @@ def progress_set(percent: int | None, project: str | None = None, note: str | No
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -1231,12 +1389,12 @@ def progress_set(percent: int | None, project: str | None = None, note: str | No
             conn.execute("UPDATE projects SET progress = ? WHERE id = ?", (percent, project_id))
         conn.commit()
         if percent is None:
-            return f"已清除 \"{project_name}\" 的进度"
+            return _resolve_warn + (f"已清除 \"{project_name}\" 的进度")
         bar = _progress_bar(percent)
         msg = f"已更新 \"{project_name}\" 进度：{bar} {percent}%"
         if note is not None:
             msg += f"  {note}"
-        return msg
+        return _resolve_warn + (msg)
     finally:
         conn.close()
 
@@ -1246,7 +1404,7 @@ def progress_get(project: str | None = None) -> str:
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -1271,7 +1429,7 @@ def progress_get(project: str | None = None) -> str:
                 format_progress(k["id"], k["name"], indent + 1)
 
         format_progress(project_id, project_name)
-        return "\n".join(lines)
+        return _resolve_warn + ("\n".join(lines))
     finally:
         conn.close()
 
@@ -1382,7 +1540,7 @@ def new_file(path: str, app: str | None = None, internal: bool = False, project:
     resolved = _resolve_project(project)
     if isinstance(resolved, str):
         return resolved
-    project_id, project_name = resolved
+    project_id, project_name, _resolve_warn = resolved
 
     conn = get_db()
     try:
@@ -1401,7 +1559,7 @@ def new_file(path: str, app: str | None = None, internal: bool = False, project:
                 # Auto-link the new file
                 file_name = Path(sub_path).name
                 link_object(str(real_path), file_name, "file", project_name)
-                return f"已创建文件：{real_path}\n已自动链接到项目 \"{project_name}\""
+                return _resolve_warn + (f"已创建文件：{real_path}\n已自动链接到项目 \"{project_name}\"")
 
         # Case 2: internal file
         if internal or not app:
@@ -1411,7 +1569,7 @@ def new_file(path: str, app: str | None = None, internal: bool = False, project:
             real_path = internal_dir / file_name
             real_path.touch()
             link_object(str(real_path), file_name, "file", project_name)
-            return f"已创建内部文件：{real_path}\n已自动链接到项目 \"{project_name}\""
+            return _resolve_warn + (f"已创建内部文件：{real_path}\n已自动链接到项目 \"{project_name}\"")
 
         # Case 3: create in external app
         # For now, we support obsidian by looking for the vault
@@ -1434,7 +1592,7 @@ def new_file(path: str, app: str | None = None, internal: bool = False, project:
             real_path = vault_path / file_name
             real_path.touch()
             link_object(str(real_path), file_name, "file", project_name)
-            return f"已在 Obsidian vault 中创建：{real_path}\n已自动链接到项目 \"{project_name}\""
+            return _resolve_warn + (f"已在 Obsidian vault 中创建：{real_path}\n已自动链接到项目 \"{project_name}\"")
 
         # Generic app: create internally and open with the app
         internal_dir = DB_DIR / "files" / str(project_id)
@@ -1444,7 +1602,7 @@ def new_file(path: str, app: str | None = None, internal: bool = False, project:
         real_path.touch()
         link_object(str(real_path), file_name, "file", project_name)
         subprocess.Popen(["open", "-a", app, str(real_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return f"已创建文件：{real_path}（使用 {app} 打开）\n已自动链接到项目 \"{project_name}\""
+        return _resolve_warn + (f"已创建文件：{real_path}（使用 {app} 打开）\n已自动链接到项目 \"{project_name}\"")
     finally:
         conn.close()
 

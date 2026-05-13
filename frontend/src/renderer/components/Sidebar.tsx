@@ -15,7 +15,7 @@ const priorityColors: Record<number, string> = {
   1: 'bg-slate-500',
 }
 
-export type SidebarView = 'columns' | 'today' | 'eisenhower' | 'inbox'
+export type SidebarView = 'columns' | 'today' | 'eisenhower' | 'inbox' | 'agents' | 'settings'
 
 interface SidebarProps {
   projects: Project[]
@@ -33,6 +33,10 @@ interface SidebarProps {
   // Live counts for the top view buttons
   todayCount: number
   inboxCount: number
+  // Collapsed = narrow icon-only mode. Auto-enabled for info-feeds so the
+  // 3-pane layout has more room.
+  collapsed: boolean
+  onToggleCollapsed: () => void
 }
 
 type DialogState =
@@ -45,6 +49,7 @@ export function Sidebar({
   projects, selectedId, onSelect, onRefresh, onObjectsChanged,
   showArchived, onToggleShowArchived,
   view, onSelectView, todayCount, inboxCount,
+  collapsed, onToggleCollapsed,
 }: SidebarProps) {
   const [menu, setMenu] = useState<{ x: number; y: number; target: Project | null } | null>(null)
   const [dialog, setDialog] = useState<DialogState>(null)
@@ -80,16 +85,18 @@ export function Sidebar({
   }
 
   const menuItems: MenuEntry[] = menu?.target
-    ? [
-        {
-          label: '✏️ 重命名',
-          onClick: () => setDialog({ kind: 'rename-project', project: menu.target! }),
-        },
-        {
-          label: '🗑 删除项目',
-          onClick: () => setDialog({ kind: 'confirm-delete', project: menu.target! }),
-        },
-      ]
+    ? (menu.target.is_inbox
+        ? [{ label: '（收件箱不可重命名或删除）', onClick: () => {} }]
+        : [
+            {
+              label: '✏️ 重命名',
+              onClick: () => setDialog({ kind: 'rename-project', project: menu.target! }),
+            },
+            {
+              label: '🗑 删除项目',
+              onClick: () => setDialog({ kind: 'confirm-delete', project: menu.target! }),
+            },
+          ])
     : [
         {
           label: '📁 新建项目',
@@ -97,15 +104,67 @@ export function Sidebar({
         },
       ]
 
+  if (collapsed) {
+    return (
+      <aside className="w-14 border-r border-border bg-sidebar flex flex-col h-full shrink-0">
+        <div className="h-12 flex items-center justify-center border-b border-border app-drag-region">
+          <button
+            onClick={onToggleCollapsed}
+            className="text-sm text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-accent"
+            title="展开侧边栏"
+          >›</button>
+        </div>
+        <nav className="flex-1 overflow-y-auto py-2 flex flex-col items-center gap-1">
+          <CollapsedViewBtn active={view === 'today'} onClick={() => onSelectView('today')} icon="📅" tip={`今天 (${todayCount})`} />
+          <CollapsedViewBtn active={view === 'eisenhower'} onClick={() => onSelectView('eisenhower')} icon="🎯" tip="四象限" />
+          <CollapsedViewBtn active={view === 'inbox'} onClick={() => onSelectView('inbox')} icon="📋" tip={`收件箱 (${inboxCount})`} />
+          <CollapsedViewBtn active={view === 'agents'} onClick={() => onSelectView('agents')} icon="🤖" tip="Agent 总览" />
+          <div className="h-px w-8 bg-border my-2" />
+          <CollapsedViewBtn active={view === 'columns'} onClick={() => onSelectView('columns')} icon="📁" tip="项目" />
+        </nav>
+      </aside>
+    )
+  }
+
   return (
     <aside
       className="w-64 min-w-48 max-w-80 border-r border-border bg-sidebar flex flex-col h-full"
       onContextMenu={handleEmptyContextMenu}
     >
-      {/* Drag region / title bar */}
-      <div className="h-12 flex items-center px-4 gap-2 border-b border-border app-drag-region">
-        <span className="text-sm font-semibold text-sidebar-foreground pl-16">lineup</span>
-        <span className="text-xs text-muted-foreground ml-auto">{projects.length} 项目</span>
+      {/* Drag region / title bar — ml-16 on the LEFT-most button leaves
+          room for the macOS traffic-light buttons; the restart (dev only)
+          and ⚙ settings buttons sit between them and the "lineup"
+          wordmark instead of taking slots in the main nav list.
+          Use ↻ for restart (matches ⚙ visual weight in Apple's system
+          font; ⏻ POWER SYMBOL renders ~30% taller and breaks header
+          layout). */}
+      <div className="h-12 flex items-center px-4 gap-0.5 border-b border-border app-drag-region">
+        {import.meta.env.DEV && (
+          <button
+            onClick={async () => {
+              if (!confirm('重启 lineup？\n会在新 Terminal 窗口重跑 npm run dev（保留全屏）。')) return
+              await window.lineup.devRestart()
+            }}
+            className="ml-16 text-sm leading-none rounded px-1.5 py-0.5 text-muted-foreground hover:text-foreground hover:bg-accent"
+            title="重启 lineup（dev：在新 Terminal 跑 npm run dev）"
+          >↻</button>
+        )}
+        <button
+          onClick={() => onSelectView('settings')}
+          className={`text-sm leading-none rounded px-1.5 py-0.5 hover:bg-accent ${
+            !import.meta.env.DEV ? 'ml-16' : ''
+          } ${
+            view === 'settings' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'
+          }`}
+          title="设置"
+        >⚙</button>
+        <span className="text-sm font-semibold text-sidebar-foreground">lineup</span>
+        <span className="text-xs text-muted-foreground ml-auto mr-2">{projects.length} 项目</span>
+        <button
+          onClick={onToggleCollapsed}
+          className="text-xs text-muted-foreground hover:text-foreground px-1 rounded hover:bg-accent"
+          title="折叠侧边栏"
+        >‹</button>
       </div>
 
       {/* Project list */}
@@ -131,6 +190,12 @@ export function Sidebar({
             icon="📋"
             label="收件箱"
             count={inboxCount}
+          />
+          <ViewButton
+            active={view === 'agents'}
+            onClick={() => onSelectView('agents')}
+            icon="🤖"
+            label="Agent 总览"
           />
         </div>
 
@@ -298,6 +363,24 @@ export function Sidebar({
         />
       )}
     </aside>
+  )
+}
+
+function CollapsedViewBtn({ active, onClick, icon, tip }: {
+  active: boolean
+  onClick: () => void
+  icon: string
+  tip: string
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={tip}
+      className={cn(
+        'w-9 h-9 flex items-center justify-center rounded text-base hover:bg-accent/50 transition-colors',
+        active && 'bg-accent text-accent-foreground',
+      )}
+    >{icon}</button>
   )
 }
 

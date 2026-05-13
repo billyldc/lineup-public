@@ -58,3 +58,4 @@ def load_all():
     from lineup.plugins import obsidian  # noqa: F401
     from lineup.plugins import trilium  # noqa: F401
     from lineup.plugins import zotero  # noqa: F401
+    from lineup.plugins import mail  # noqa: F401

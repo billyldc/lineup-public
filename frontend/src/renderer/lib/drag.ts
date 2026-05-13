@@ -78,13 +78,49 @@ export function parseDragPayload(e: React.DragEvent): AnyDragPayload | null {
  * dragover (Chromium hides custom-type contents until drop). Filtering
  * happens in the drop handler instead.
  */
+/**
+ * Whether the "move" modifier is held.
+ *
+ * macOS reality check:
+ *   - Ctrl+drag is UNUSABLE on macOS. The OS intercepts Ctrl+mousedown as
+ *     right-click before the browser sees it, so HTML5 drag never starts.
+ *   - Cmd (meta) and Alt (option) are safe — both pass through cleanly.
+ *
+ * Modifier state inside DragEvents is also flaky on macOS Chromium — the
+ * user can press/release Cmd mid-drag and the dragover/drop events may
+ * still carry stale state. So we ALSO maintain a global keydown/keyup
+ * tracker; the final `isMoveModifier` trusts whichever source says "yes".
+ *
+ * Net effect: Cmd+drag or Alt+drag = move, any other = copy. Works
+ * reliably on macOS; works on Windows/Linux too (there Alt is probably
+ * what users reach for).
+ */
+const modState = { meta: false, alt: false }
+if (typeof window !== 'undefined') {
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Meta' || e.key === 'OS' /* Win key on some platforms */) modState.meta = true
+    else if (e.key === 'Alt') modState.alt = true
+  })
+  window.addEventListener('keyup', (e) => {
+    if (e.key === 'Meta' || e.key === 'OS') modState.meta = false
+    else if (e.key === 'Alt') modState.alt = false
+  })
+  // Reset when window loses focus (e.g. user released key over a different app).
+  window.addEventListener('blur', () => { modState.meta = false; modState.alt = false })
+}
+
+export function isMoveModifier(e: React.DragEvent | DragEvent): boolean {
+  return e.metaKey || e.altKey || modState.meta || modState.alt
+}
+
 export function handleObjectDragOver(e: React.DragEvent): void {
-  // Cheap optimization: if the drag has any types and none of them is ours,
-  // skip — but if types is empty (some Chromium edge cases) accept anyway.
-  const types = e.dataTransfer.types
-  if (types.length > 0 && !types.includes(MIME)) return
+  // Don't interfere with native file drops from Finder (those carry 'Files').
+  // For all internal drags, always preventDefault so drop fires — we filter
+  // by MIME at drop time. Some browsers hide custom MIME during dragover
+  // for security, so a strict type check here silently kills the drop.
+  if (e.dataTransfer.types.includes('Files')) return
   e.preventDefault()
-  e.dataTransfer.dropEffect = e.ctrlKey ? 'move' : 'copy'
+  e.dataTransfer.dropEffect = isMoveModifier(e) ? 'move' : 'copy'
 }
 
 /**
@@ -105,13 +141,13 @@ export async function performDrop(
   const payload = parseDragPayload(e)
   if (!payload) return false
 
+  const isMove = isMoveModifier(e)
+
   if (payload.kind === 'project-ref') {
     if (payload.projectId === destProjectId) return false
-    if (e.ctrlKey && payload.sourceParentId > 0) {
-      // Move: re-parent from old → new (only if dragged from a real parent)
+    if (isMove && payload.sourceParentId && payload.sourceParentId > 0) {
       await window.lineup.moveProject(payload.projectId, payload.sourceParentId, destProjectId)
     } else {
-      // Reference: add a second parent link (project appears in both places)
       await window.lineup.addProjectParent(payload.projectId, destProjectId)
     }
     refresh()
@@ -123,7 +159,7 @@ export async function performDrop(
     return false
   }
   await window.lineup.linkObject(destProjectId, payload.name, payload.target, payload.type)
-  if (e.ctrlKey && payload.id != null) {
+  if (isMove && payload.id != null) {
     await window.lineup.removeObject(payload.id)
   }
   refresh()

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import type { BrowseItem } from '../../preload/index'
 
-type Source = 'obsidian' | 'trilium' | 'zotero'
+type Source = 'obsidian' | 'trilium' | 'zotero' | 'mail'
 
 interface BrowseDialogProps {
   source: Source
@@ -14,6 +14,7 @@ const sourceLabels: Record<Source, string> = {
   obsidian: 'Obsidian',
   trilium: 'Trilium',
   zotero: 'Zotero',
+  mail: 'Apple Mail',
 }
 
 interface Crumb {
@@ -27,6 +28,9 @@ export function BrowseDialog({ source, title, onSelect, onCancel }: BrowseDialog
   const [loading, setLoading] = useState(false)
   const [selected, setSelected] = useState<BrowseItem | null>(null)
   const [query, setQuery] = useState('')
+  // Mail-specific: track sync state so we can show feedback + disable button.
+  const [syncing, setSyncing] = useState(false)
+  const [syncError, setSyncError] = useState<string | null>(null)
   const searchTimer = useRef<number | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
 
@@ -39,6 +43,7 @@ export function BrowseDialog({ source, title, onSelect, onCancel }: BrowseDialog
       const list =
         source === 'obsidian' ? await window.lineup.browseObsidian(path)
         : source === 'trilium' ? await window.lineup.browseTrilium(path)
+        : source === 'mail'    ? await window.lineup.browseMail(path)
         : await window.lineup.browseZotero(path)
       setItems(list)
     } finally {
@@ -53,6 +58,7 @@ export function BrowseDialog({ source, title, onSelect, onCancel }: BrowseDialog
       const list =
         source === 'obsidian' ? await window.lineup.searchObsidian(q)
         : source === 'trilium' ? await window.lineup.searchTrilium(q)
+        : source === 'mail'    ? await window.lineup.searchMail(q)
         : await window.lineup.searchZotero(q)
       setItems(list)
     } finally {
@@ -121,7 +127,32 @@ export function BrowseDialog({ source, title, onSelect, onCancel }: BrowseDialog
       >
         {/* Header */}
         <div className="px-4 py-3 border-b border-border shrink-0">
-          <div className="text-sm font-medium">{title} — 浏览 {sourceLabels[source]}</div>
+          <div className="text-sm font-medium flex items-center gap-2">
+            <span>{title} — 浏览 {sourceLabels[source]}</span>
+            {source === 'mail' && (
+              <button
+                onClick={async () => {
+                  setSyncing(true)
+                  setSyncError(null)
+                  try {
+                    const r = await window.lineup.syncMail()
+                    if (!r.ok) setSyncError(r.error ?? 'unknown error')
+                    // Reload browse/search to reflect newly cached rows.
+                    if (isSearchMode) await runSearch(query.trim())
+                    else await loadBrowse(crumbs[crumbs.length - 1]?.path ?? '')
+                  } finally {
+                    setSyncing(false)
+                  }
+                }}
+                disabled={syncing}
+                className="ml-auto text-xs px-2 py-0.5 rounded border border-border hover:bg-accent disabled:opacity-50"
+                title="从 Mail.app 拉最新 200 封/账户 到本地缓存（可能几十秒）"
+              >{syncing ? '同步中...' : '🔄 同步邮件'}</button>
+            )}
+          </div>
+          {source === 'mail' && syncError && (
+            <div className="text-[11px] text-red-500 mt-1 font-mono">{syncError}</div>
+          )}
 
           {/* Search input */}
           <input
