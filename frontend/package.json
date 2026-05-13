@@ -6,6 +6,7 @@
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "demo": "node ../scripts/run-demo.mjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "postinstall": "electron-rebuild -f -o better-sqlite3 && (electron-rebuild -f -o node-pty || echo 'WARN: node-pty rebuild failed; embedded terminal disabled. Fix: pip3 install setuptools && npx electron-rebuild -f -o node-pty'); chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",

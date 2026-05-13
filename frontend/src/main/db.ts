@@ -10,7 +10,7 @@
 
 import { join } from 'path'
 import { homedir } from 'os'
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync } from 'fs'
 import { createRequire } from 'module'
 
 const nativeRequire = createRequire(import.meta.url || __filename)
@@ -117,6 +117,21 @@ export function getDb(): any {
 
   if (isNew) {
     _db.exec(CORE_SCHEMA)
+    // First-launch seed: if a `seed.sql` sits next to the freshly-created
+    // DB, apply it. This is what `npm run demo` triggers — it sets
+    // LINEUP_DATA_DIR=<repo>/demo-data, where demo-data/seed.sql is
+    // checked into the repo. Users get a populated app on first launch
+    // with zero CLI gymnastics. For a normal install (LINEUP_HOME =
+    // ~/.lineup), there's no seed.sql so this branch is a no-op.
+    const seedPath = join(LINEUP_HOME, 'seed.sql')
+    if (existsSync(seedPath)) {
+      try {
+        _db.exec(readFileSync(seedPath, 'utf8'))
+        console.log('[db] applied demo seed from', seedPath)
+      } catch (e) {
+        console.error('[db] seed.sql exists but failed to apply:', e)
+      }
+    }
   }
 
   // ── Migrations ────────────────────────────────────────────────────

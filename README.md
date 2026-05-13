@@ -50,12 +50,22 @@ Built with Electron + React + TypeScript + Tailwind CSS + better-sqlite3.
 - **Todoist** — one-way sync of Todoist projects into lineup
 - See [docs/sources.md](docs/sources.md) for setup, especially the email walkthrough
 
+**Claude Code session browser** *(zero setup if you already use Claude Code)*
+
+If you've ever run `claude` in a terminal, every transcript lives at `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. Lineup walks that directory and surfaces **every Claude Code session you've ever started** — your own coding work, agents launched by other tools (e.g. `openclaw`, `claude-flow`, custom CLIs), one-off explorations, all of it — grouped by working folder and time bucket.
+
+- **Folder tree**: drill from "all folders you've used Claude in" → individual session timelines
+- **Per-session inspector**: full prompt+response timeline, token + cost breakdown, model used, summary
+- **Time-bucket rollups** (optional, opt-in MiMo summarization): one-line summaries for every 4-hour block, every day, every cluster
+- **Search across all sessions**: ⌘F hits session bodies too
+
+This is the fastest way to answer "wait, how did I solve that bug last week" or "what has openclaw been spending my Anthropic credits on" — without leaving lineup.
+
 **AI agent system** *(optional, requires [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code))*
 - Embedded terminal (xterm.js + node-pty) running Claude Code per project
 - Per-project virtual workspace with auto-generated CLAUDE.md (editable from the inspector drawer)
 - Agent dispatch: main agent can orchestrate sub-agents across folders
 - MCP integration for structured project/task/step management
-- Agents view: navigate Claude Code sessions across all projects, drill into individual session timelines
 - Live memory monitor for diagnosing runaway Electron / pty processes
 
 ## Quick start
@@ -63,25 +73,24 @@ Built with Electron + React + TypeScript + Tailwind CSS + better-sqlite3.
 ```bash
 git clone https://github.com/billyldc/lineup-public.git
 cd lineup-public/frontend
-npm install
+npm install        # ~1 min, rebuilds native modules against Electron
+npm run demo       # launches a populated sandbox app — try first
+```
+
+`npm run demo` points lineup at `<repo>/demo-data/` (a throwaway sandbox), seeds it with sample projects + tasks + objects, and launches Electron. **Your real `~/.lineup/` is never touched.** Quit with Ctrl+C. Re-run any time; pass `--reset` to wipe and re-seed.
+
+Once you've poked around the demo and want to use lineup for real:
+
+```bash
+cd lineup-public/frontend
 npm run dev
 ```
 
-The app auto-creates `~/.lineup/lineup.db` on first launch — no Python required for basic project management.
-
-### Try the demo (with sample data)
-
-To explore the app without touching your real data, launch with an isolated data dir and load the seed file:
+This launches against `~/.lineup/lineup.db`, which is auto-created on first launch (no Python required). If you want to run the app pointed at *any* custom data dir — multiple isolated instances for work vs personal, test environments, etc. — set `LINEUP_DATA_DIR`:
 
 ```bash
-cd lineup-public
-LINEUP_DATA_DIR=$(pwd)/demo-data npm --prefix frontend run dev  # first run creates empty DB
-# Ctrl+C, then:
-sqlite3 demo-data/lineup.db < demo-data/seed.sql
-LINEUP_DATA_DIR=$(pwd)/demo-data npm --prefix frontend run dev  # relaunch with data
+LINEUP_DATA_DIR=~/my-other-lineup npm run dev
 ```
-
-The `LINEUP_DATA_DIR` env var redirects all lineup state (DB, virtual project folders, `.mcp.json`) into a sandbox directory. Useful for screenshots, testing, and running multiple instances (work vs personal).
 
 ### Troubleshooting native modules
 
