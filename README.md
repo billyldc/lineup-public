@@ -161,6 +161,33 @@ Create `~/.lineup/config.json` to customize paths (all fields optional):
 
 See [docs/sources.md](docs/sources.md) for the full source-by-source setup walkthrough — including how to wire up Apple Mail (the most useful source for most users) without touching IMAP / OAuth yourself.
 
+### LLM key (for session summaries + auto-titles)
+
+The basic project-management features (Miller columns, Today / Eisenhower / Inbox views, file linking, embedded Claude Code terminal) need **no API key** — they're all local.
+
+A few features call out to an LLM and need a key:
+
+- **Session summarization** in the Agents view (the "summarize this session" button)
+- **MimoGenerate auto-titles** for Claude sessions
+- **Time-bucket rollups** (4-hour / daily summaries of agent activity)
+
+Drop a single-line OpenRouter API key at `~/.lineup/openrouter_key`:
+
+```bash
+echo "sk-or-..." > ~/.lineup/openrouter_key
+chmod 600 ~/.lineup/openrouter_key
+```
+
+Or set `OPENROUTER_API_KEY` in your environment. Lineup will use OpenRouter's auto-rotating model fallback list (Sonnet → Opus → Gemini → DeepSeek) so a single key's region/credit issues don't break the feature.
+
+**Advanced** (optional): if you already run a local multi-provider router that exposes a `/chat` endpoint (e.g. one fronting MiMo + Volcano + 智增增 + OpenRouter for cross-provider load balancing), point lineup at it:
+
+```bash
+export LLM_ROUTER_URL=http://127.0.0.1:8765
+```
+
+Lineup will try the router first and transparently fall back to direct OpenRouter on connection failure, so neither path is a hard dependency.
+
 ## Keyboard shortcuts
 
 | Key | Action |

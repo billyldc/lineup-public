@@ -2781,20 +2781,25 @@ function extractL1Title(summary: string): string {
   return ''
 }
 
-// ── LLM (via local llm-router) for session titles + bucket summaries ──
+// ── LLM (router + OpenRouter fallback) for session titles + bucket summaries ──
 //
-// All LLM calls from the Electron main process go through the local
-// llm-router service (~/utilities/llm-router/, listening on
-// http://127.0.0.1:8765). The router owns API keys (loaded from
-// ~/utilities/llm-router/.env), per-provider concurrency, 429 retry, and
-// cross-provider fallover — none of that has to live here anymore.
+// Two ways to get an LLM for auto-title / time-bucket summaries:
 //
-// We previously hit MiMo directly with `fetch` and read MIMO_API_KEY out
-// of the zshrc. Bad: keys had to be in two places, no fallover when MiMo
-// 429'd, and Electron doesn't inherit shell env so users were chasing
-// "key not found" errors after restarts.
+//   1. (default) Drop an OpenRouter API key in ~/.lineup/openrouter_key
+//      and lineup will hit OpenRouter directly with the same fallback model
+//      list it uses for `agents:summarizeSession` — no extra service to run.
+//
+//   2. (advanced) Run a local llm-router (load-balancer across multiple
+//      providers — MiMo / Volcano / DeepSeek / OpenRouter / etc) and set
+//      LLM_ROUTER_URL=http://127.0.0.1:8765. The router owns API keys,
+//      per-provider concurrency, 429 retry, and cross-provider fallover.
+//      Lineup will try the router first; if the connection fails it
+//      transparently falls back to direct OpenRouter so the feature
+//      never goes dark just because the router is down.
+//
+// `callRouter` below implements both paths.
 
-const LLM_ROUTER_BASE = process.env.LLM_ROUTER_URL || 'http://127.0.0.1:8765'
+const LLM_ROUTER_BASE = process.env.LLM_ROUTER_URL || ''
 
 // Default model + provider for our reasoning summaries. mimo-v2.5-pro is
 // MiMo's current non-preview pro reasoning model; the router will fall
@@ -2804,8 +2809,15 @@ const DEFAULT_REASONING_MODEL = 'mimo-v2.5-pro'
 const DEFAULT_REASONING_PROVIDER = 'mimo'
 
 /**
- * One-shot chat through the local llm-router. Returns the same shape the
- * old direct-MiMo `callMimo` did so existing callers don't change.
+ * One-shot chat for short LLM tasks (auto-title, bucket summary).
+ *
+ * Path 1 — router: if LLM_ROUTER_URL is set, POST to <url>/chat.
+ * Path 2 — OpenRouter fallback: when path 1 is skipped or its connection
+ *          fails, fall through to a direct OpenRouter call using the
+ *          same key + model fallback list as `openrouterCall`.
+ *
+ * Either way, returns the original llm-router-shaped success object so
+ * upstream callers don't change.
  */
 async function callRouter(system: string, user: string, opts: {
   model?: string
@@ -2816,44 +2828,48 @@ async function callRouter(system: string, user: string, opts: {
   | { ok: true; content: string; input_tokens: number; output_tokens: number }
   | { ok: false; error: string }
 > {
-  const body: Record<string, unknown> = {
-    system, user,
-    max_tokens: opts.maxTokens ?? 4000,
-    timeout: opts.timeoutSec ?? 180,
-  }
-  if (opts.model) body.model = opts.model
-  if (opts.preferred) body.preferred = opts.preferred
-  let resp: Response
-  try {
-    resp = await fetch(`${LLM_ROUTER_BASE}/chat`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-  } catch (e: any) {
-    return {
-      ok: false,
-      error: `llm-router 不可达 (${LLM_ROUTER_BASE}): ${e?.message ?? e}。试试 \`launchctl kickstart -k gui/$(id -u)/com.llm-router\``,
+  if (LLM_ROUTER_BASE) {
+    const body: Record<string, unknown> = {
+      system, user,
+      max_tokens: opts.maxTokens ?? 4000,
+      timeout: opts.timeoutSec ?? 180,
+    }
+    if (opts.model) body.model = opts.model
+    if (opts.preferred) body.preferred = opts.preferred
+    let resp: Response
+    try {
+      resp = await fetch(`${LLM_ROUTER_BASE}/chat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (resp.ok) {
+        const j: any = await resp.json()
+        const content = String(j?.content ?? '').trim()
+        if (content) {
+          return {
+            ok: true,
+            content,
+            input_tokens: Number(j?.input_tokens ?? 0) || 0,
+            output_tokens: Number(j?.output_tokens ?? 0) || 0,
+          }
+        }
+        // Empty content from the router — fall through to OpenRouter.
+        console.log('[llm] router returned empty content, falling back to OpenRouter')
+      } else {
+        const t = await resp.text().catch(() => '')
+        console.log(`[llm] router HTTP ${resp.status}: ${t.slice(0, 200)} — falling back to OpenRouter`)
+      }
+    } catch (e: any) {
+      console.log(`[llm] router unreachable (${LLM_ROUTER_BASE}): ${e?.message ?? e} — falling back to OpenRouter`)
     }
   }
-  if (!resp.ok) {
-    const t = await resp.text().catch(() => '')
-    return { ok: false, error: `router HTTP ${resp.status}: ${t.slice(0, 200)}` }
-  }
-  let j: any
-  try { j = await resp.json() } catch (e: any) {
-    return { ok: false, error: `router 返回非 JSON: ${e?.message ?? e}` }
-  }
-  // The /chat endpoint returns {content, input_tokens, output_tokens,
-  // provider_id, model} on success; HTTP 502 on hard failure.
-  const content = String(j?.content ?? '').trim()
-  if (!content) return { ok: false, error: 'router 返回空内容' }
-  return {
-    ok: true,
-    content,
-    input_tokens:  Number(j?.input_tokens ?? 0) || 0,
-    output_tokens: Number(j?.output_tokens ?? 0) || 0,
-  }
+
+  // OpenRouter fallback. openrouterCall handles key lookup + model rotation;
+  // its output shape is a superset of ours so we just project the fields.
+  const r = await openrouterCall(system, user)
+  if (r.ok) return { ok: true, content: r.content, input_tokens: r.input_tokens, output_tokens: r.output_tokens }
+  return { ok: false, error: r.error }
 }
 
 /**
