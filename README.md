@@ -50,16 +50,22 @@ Built with Electron + React + TypeScript + Tailwind CSS + better-sqlite3.
 - **Todoist** — one-way sync of Todoist projects into lineup
 - See [docs/sources.md](docs/sources.md) for setup, especially the email walkthrough
 
-**Claude Code session browser** *(zero setup if you already use Claude Code)*
+**Multi-source agent session browser** *(zero setup if you already use any of these tools)*
 
-If you've ever run `claude` in a terminal, every transcript lives at `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`. Lineup walks that directory and surfaces **every Claude Code session you've ever started** — your own coding work, agents launched by other tools (e.g. `openclaw`, `claude-flow`, custom CLIs), one-off explorations, all of it — grouped by working folder and time bucket.
+Most coding agents drop a transcript on disk for every conversation. Lineup walks those directories and surfaces **every session you've ever had with any supported agent**, grouped by working folder and time bucket — read-only, no API keys, nothing to configure.
 
-- **Folder tree**: drill from "all folders you've used Claude in" → individual session timelines
-- **Per-session inspector**: full prompt+response timeline, token + cost breakdown, model used, summary
-- **Time-bucket rollups** (optional, opt-in MiMo summarization): one-line summaries for every 4-hour block, every day, every cluster
-- **Search across all sessions**: ⌘F hits session bodies too
+| Agent | Where lineup reads | Status in lineup |
+| --- | --- | --- |
+| **Claude Code** | `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` | view + resume in embedded terminal |
+| **openclaw** | same store (openclaw wraps Claude Code) — auto-detected via path | view + resume |
+| **Codex** (OpenAI CLI / ChatGPT Codex) | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | view-only |
+| **Hermes** | `~/.hermes/sessions/*.jsonl` | view-only |
 
-This is the fastest way to answer "wait, how did I solve that bug last week" or "what has openclaw been spending my Anthropic credits on" — without leaving lineup.
+The Agents view shows a colored badge on every row so you can tell at a glance which agent ran which conversation, with a per-source filter chip ("only Codex", "only openclaw", etc.). Inside each session you get the full prompt + response timeline, model used, token / cost breakdown for the agents that record it, and optional MiMo-generated one-line summaries.
+
+This is the fastest way to answer "wait, how did I solve that bug last week", "what has openclaw been spending my Anthropic credits on", or "what was the prompt I tried in Codex yesterday" — without leaving lineup.
+
+Adding another agent is a small reader file in [`frontend/src/main/sessionSources.ts`](frontend/src/main/sessionSources.ts) — see [docs/sessions.md](docs/sessions.md) for the recipe and notes on what it would take to bring resume-in-lineup-terminal support to Codex.
 
 **AI agent system** *(optional, requires [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code))*
 - Embedded terminal (xterm.js + node-pty) running Claude Code per project

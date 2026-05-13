@@ -131,6 +131,19 @@ export interface Agent {
   // Discovered-only
   last_modified?: string
   message_count?: number
+  // Which agent toolchain this session belongs to. 'claude' covers Claude
+  // Code's local store at ~/.claude/projects (which also catches anything
+  // openclaw runs — same store). 'codex' = ~/.codex/sessions, 'hermes' =
+  // ~/.hermes/sessions. Lineup can resume claude in the embedded terminal,
+  // but the others are read-only; AgentsView gates open-in-lineup on this.
+  source?: 'claude' | 'codex' | 'hermes'
+  // For source='claude', whether the workspace is openclaw (i.e. the
+  // session was recorded by openclaw's Claude Code wrapper). Cosmetic only;
+  // lineup-public treats it as a normal Claude session for resume purposes.
+  flavor?: 'claude' | 'codex' | 'hermes' | 'openclaw'
+  // Internal: external sources stash their jsonl path here so the dispatcher
+  // doesn't have to re-walk the filesystem on read.
+  external_path?: string
 }
 
 export interface TimelineEvent {

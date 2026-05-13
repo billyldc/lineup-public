@@ -21,6 +21,23 @@ const STORAGE_FILTER = 'lineup:agentsActivityFilter'
 const FILTER_LABELS: Record<ActivityFilter, string> = {
   all: '全部', '1d': '近 1 天', '1w': '近 1 周', '1m': '近 1 月',
 }
+
+type SourceFilter = 'all' | 'claude' | 'openclaw' | 'codex' | 'hermes'
+const STORAGE_SOURCE = 'lineup:agentsSourceFilter'
+// Badge colours and emoji per flavor. Kept inline (not Tailwind theme) so
+// they're visually distinct even when the user has a custom theme.
+const FLAVOR_META: Record<NonNullable<Agent['flavor']>, { label: string; bg: string; fg: string }> = {
+  claude:   { label: 'Claude',   bg: '#f7d6b3', fg: '#774012' },
+  openclaw: { label: 'openclaw', bg: '#cdb4f3', fg: '#3f1c79' },
+  codex:    { label: 'Codex',    bg: '#bce0d3', fg: '#0e5947' },
+  hermes:   { label: 'Hermes',   bg: '#f5c2c0', fg: '#7a1f1c' },
+}
+// Whether lineup can resume a session of this flavor in the embedded chat
+// panel / external terminal. Currently only Claude (incl. openclaw, which
+// IS Claude Code under the hood). Codex / Hermes are read-only viewers.
+function isResumable(flavor: Agent['flavor'] | undefined): boolean {
+  return flavor === 'claude' || flavor === 'openclaw' || flavor === undefined
+}
 const FILTER_CUTOFF_MS: Record<ActivityFilter, number> = {
   all: Infinity,
   '1d': 24 * 60 * 60 * 1000,
@@ -64,6 +81,11 @@ export function AgentsView({
     return v === '1d' || v === '1w' || v === '1m' || v === 'all' ? v : 'all'
   })
   useEffect(() => { localStorage.setItem(STORAGE_FILTER, activityFilter) }, [activityFilter])
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>(() => {
+    const v = localStorage.getItem(STORAGE_SOURCE) as SourceFilter
+    return ['all', 'claude', 'openclaw', 'codex', 'hermes'].includes(v) ? v : 'all'
+  })
+  useEffect(() => { localStorage.setItem(STORAGE_SOURCE, sourceFilter) }, [sourceFilter])
 
   // When the parent passes a one-shot initialQuery (📜 历史 from a chat
   // tab), populate the search box and consume it so future renders don't
@@ -112,6 +134,9 @@ export function AgentsView({
     if (agents.length === 0) return
     const payload = agents
       .filter(a =>
+        // Auto-title is built around Claude Code's jsonl schema and MiMo
+        // prompt; codex / hermes have different formats so we skip them.
+        isResumable(a.flavor) &&
         a.folder_path &&
         a.last_modified &&
         !autoTitledRef.current.has(`${a.session_id}:${a.last_modified}`)
@@ -149,6 +174,7 @@ export function AgentsView({
   const visibleAgents = useMemo(() => {
     const q = query.trim().toLowerCase()
     return agents.filter(a => {
+      if (sourceFilter !== 'all' && (a.flavor ?? 'claude') !== sourceFilter) return false
       if (q) {
         const hay = (a.name + ' ' + (a.folder_path ?? '')).toLowerCase()
         if (!hay.includes(q)) return false
@@ -161,7 +187,7 @@ export function AgentsView({
       }
       return true
     })
-  }, [agents, query, cutoff, now])
+  }, [agents, query, cutoff, now, sourceFilter])
 
   const buckets: Bucket[] = useMemo(() => {
     const byFolder = new Map<string, Agent[]>()
@@ -211,7 +237,7 @@ export function AgentsView({
             ↻ 刷新
           </button>
         </div>
-        <div className="mt-3 flex items-center gap-1">
+        <div className="mt-3 flex items-center gap-1 flex-wrap">
           {(['all', '1d', '1w', '1m'] as ActivityFilter[]).map(f => (
             <button
               key={f}
@@ -222,6 +248,19 @@ export function AgentsView({
                   : 'border-border hover:bg-accent/50 text-muted-foreground'
               }`}
             >{FILTER_LABELS[f]}</button>
+          ))}
+          <span className="text-xs text-muted-foreground/60 mx-2">·</span>
+          {(['all', 'claude', 'openclaw', 'codex', 'hermes'] as SourceFilter[]).map(s => (
+            <button
+              key={s}
+              onClick={() => setSourceFilter(s)}
+              className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                sourceFilter === s
+                  ? 'bg-primary text-primary-foreground border-primary'
+                  : 'border-border hover:bg-accent/50 text-muted-foreground'
+              }`}
+              title={s === 'all' ? '所有来源' : `仅显示 ${s} 会话`}
+            >{s === 'all' ? '所有来源' : (FLAVOR_META[s as keyof typeof FLAVOR_META]?.label ?? s)}</button>
           ))}
         </div>
         <input
@@ -257,11 +296,15 @@ export function AgentsView({
             </header>
 
             <div>
-              {b.sessions.map((s) => (
+              {b.sessions.map((s) => {
+                const flavor = s.flavor ?? 'claude'
+                const meta = FLAVOR_META[flavor]
+                const resumable = isResumable(flavor)
+                return (
                 <button
                   key={s.session_id || `${s.id}`}
                   onClick={() => onSelectAgent(s)}
-                  onDoubleClick={() => onOpenAgent(s)}
+                  onDoubleClick={() => { if (resumable) onOpenAgent(s) }}
                   onContextMenu={(e) => {
                     e.preventDefault()
                     setMenu({ agent: s, x: e.clientX, y: e.clientY })
@@ -270,13 +313,21 @@ export function AgentsView({
                     ${selectedAgentSessionId === s.session_id
                       ? 'bg-primary/10'
                       : 'hover:bg-accent/50'}`}
-                  title="单击查看详情 · 双击在 lineup 内嵌终端打开 · 右键更多选项"
+                  title={resumable
+                    ? '单击查看详情 · 双击在 lineup 内嵌终端打开 · 右键更多选项'
+                    : `单击查看详情 · ${meta.label} 会话只读，不支持在 lineup 中续聊`}
                 >
                   <span className="text-xs text-muted-foreground shrink-0 mt-0.5">
                     {s.is_db ? '★' : '·'}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <div className="text-sm truncate">{s.name || s.session_id.slice(0, 8)}</div>
+                    <div className="text-sm truncate flex items-center gap-2">
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0 uppercase tracking-wide"
+                        style={{ background: meta.bg, color: meta.fg }}
+                      >{meta.label}</span>
+                      <span className="truncate">{s.name || s.session_id.slice(0, 8)}</span>
+                    </div>
                     <div className="text-xs text-muted-foreground mt-0.5 flex items-center gap-2 flex-wrap">
                       <span className="font-mono">{s.session_id.slice(0, 8)}</span>
                       {typeof s.message_count === 'number' && s.message_count > 0 && (
@@ -288,7 +339,8 @@ export function AgentsView({
                     {formatDate(s.last_modified ?? s.last_active_at ?? '')}
                   </span>
                 </button>
-              ))}
+                )
+              })}
             </div>
           </section>
         ))}
@@ -334,42 +386,48 @@ export function AgentsView({
             }}
             className="w-full text-left px-3 py-1.5 hover:bg-accent"
           >🔑 复制 session ID</button>
-          <div className="border-t border-border my-1" />
-          <button
-            onClick={async () => {
-              const ag = menu.agent
-              setMenu(null)
-              // Resolve a cwd that ACTUALLY matches where the jsonl
-              // lives, not the per-line cwd field (which can drift from
-              // storage location after fork / auto-compact / lineup
-              // re-mount). Falls back to folder_path only when there's
-              // no session_id (fresh-spawn case, no resume needed).
-              let cwd = ag.folder_path ?? ''
-              if (ag.session_id) {
-                const r = await window.lineup.resolveResumeCwd(ag.session_id)
-                if (r.ok && r.cwd) {
-                  cwd = r.cwd
-                } else if (!cwd) {
-                  alert(`无法定位 session ${ag.session_id.slice(0,8)}：${r.error ?? '未知错误'}`)
-                  return
-                }
-                // If resolveResumeCwd failed but we have a folder_path,
-                // fall through and try anyway — at worst the user sees
-                // claude's own "no session found" error and can cd
-                // manually. Better than refusing to open the terminal.
-              }
-              if (!cwd) { return }
-              await window.lineup.openExternalTerminalWithCommand(
-                cwd,
-                ag.session_id ? `claude --resume ${ag.session_id}` : 'claude',
-              )
-            }}
-            className="w-full text-left px-3 py-1.5 hover:bg-accent"
-          >🖥 在 Terminal 打开（预填 --resume）</button>
-          <button
-            onClick={() => { onOpenAgent(menu.agent); setMenu(null) }}
-            className="w-full text-left px-3 py-1.5 hover:bg-accent"
-          >💬 在 lineup 内嵌终端打开</button>
+          {isResumable(menu.agent.flavor) && (
+            <>
+              <div className="border-t border-border my-1" />
+              <button
+                onClick={async () => {
+                  const ag = menu.agent
+                  setMenu(null)
+                  // Resolve a cwd that ACTUALLY matches where the jsonl
+                  // lives, not the per-line cwd field (which can drift from
+                  // storage location after fork / auto-compact / lineup
+                  // re-mount). Falls back to folder_path only when there's
+                  // no session_id (fresh-spawn case, no resume needed).
+                  let cwd = ag.folder_path ?? ''
+                  if (ag.session_id) {
+                    const r = await window.lineup.resolveResumeCwd(ag.session_id)
+                    if (r.ok && r.cwd) {
+                      cwd = r.cwd
+                    } else if (!cwd) {
+                      alert(`无法定位 session ${ag.session_id.slice(0,8)}：${r.error ?? '未知错误'}`)
+                      return
+                    }
+                  }
+                  if (!cwd) { return }
+                  await window.lineup.openExternalTerminalWithCommand(
+                    cwd,
+                    ag.session_id ? `claude --resume ${ag.session_id}` : 'claude',
+                  )
+                }}
+                className="w-full text-left px-3 py-1.5 hover:bg-accent"
+              >🖥 在 Terminal 打开（预填 --resume）</button>
+              <button
+                onClick={() => { onOpenAgent(menu.agent); setMenu(null) }}
+                className="w-full text-left px-3 py-1.5 hover:bg-accent"
+              >💬 在 lineup 内嵌终端打开</button>
+            </>
+          )}
+          {!isResumable(menu.agent.flavor) && (
+            <div className="px-3 py-1.5 text-xs text-muted-foreground/80 border-t border-border mt-1">
+              {FLAVOR_META[menu.agent.flavor ?? 'claude'].label} 会话只读 ·
+              lineup 暂未集成 {FLAVOR_META[menu.agent.flavor ?? 'claude'].label} CLI 续聊
+            </div>
+          )}
         </div>
       )}
 

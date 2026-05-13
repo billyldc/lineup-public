@@ -8,6 +8,7 @@ import { createHash } from 'crypto'
 import { createRequire } from 'module'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { getDb } from './db'
+import * as sessionSources from './sessionSources'
 import {
   startMemoryMonitor, captureSample as captureMemorySample,
   getRecentSamples as getMemorySamples, getLogPath as getMemoryLogPath,
@@ -1717,6 +1718,37 @@ async function listAllClaudeSessions(): Promise<any[]> {
     if (fa) e.name = `${fa.project_name} · ${fa.alias}`
   }
 
+  // Tag every claude entry with source + flavor so the renderer can show
+  // an "openclaw" badge for sessions that live under an openclaw workspace.
+  for (const e of valid) {
+    e.source = 'claude'
+    e.flavor = sessionSources.flavorClaudeSession(e.folder_path)
+  }
+
+  // Layer codex + hermes sessions on top. These are read-only — lineup
+  // can't resume them in the embedded terminal (the chat panel spawns
+  // `claude`, not `codex` / `hermes`), so AgentsView gates its
+  // "open in lineup" / "open in terminal" affordances on source==='claude'.
+  try {
+    const external = await sessionSources.listExternalSessions()
+    for (const e of external) {
+      valid.push({
+        session_id: e.session_id,
+        folder_path: e.folder_path,
+        name: e.name,
+        last_modified: e.last_modified,
+        message_count: e.message_count,
+        is_db: false,
+        source: e.source,
+        flavor: e.source,
+        // Stash the file path so getSessionData can re-open without re-walking.
+        external_path: e.file_path,
+      })
+    }
+  } catch (err) {
+    console.error('[sessions] external source scan failed:', err)
+  }
+
   valid.sort((a, b) => b.last_modified.localeCompare(a.last_modified))
   return valid
 }
@@ -2057,6 +2089,22 @@ async function getSessionData(folderPath: string, sessionId: string): Promise<
   { ok: true; data: SessionData } | { ok: false; error: string }
 > {
   try {
+    // External sources (codex / hermes) live under different directory
+    // trees and use entirely different JSONL schemas. Try them first via
+    // a quick id-based lookup; fall through to Claude's logic otherwise.
+    const external = await findExternalSessionFile(sessionId)
+    if (external) {
+      const stat = statSync(external.path)
+      const cacheKey = `${external.source}:${external.path}`
+      const cached = sessionDataCache.get(cacheKey)
+      if (cached && cached.mtimeMs === stat.mtimeMs) return { ok: true, data: cached.data }
+      const data = external.source === 'codex'
+        ? await sessionSources.readCodexSession(external.path)
+        : await sessionSources.readHermesSession(external.path)
+      sessionDataCache.set(cacheKey, { mtimeMs: stat.mtimeMs, data })
+      return { ok: true, data }
+    }
+
     const jsonlPath = findJsonlPath(folderPath, sessionId)
     if (!jsonlPath) {
       return { ok: false, error: `找不到 jsonl：folder=${folderPath} session=${sessionId}` }
@@ -2070,6 +2118,21 @@ async function getSessionData(folderPath: string, sessionId: string): Promise<
   } catch (e: any) {
     return { ok: false, error: e?.message ?? String(e) }
   }
+}
+
+/**
+ * Locate an external (codex / hermes) session by its lineup-side session_id.
+ * Scans both sources and matches on either the recorded session id (for codex,
+ * the UUID in payload.id) or the filename stem (for hermes, the `<date>_<id>`).
+ * Returns null when the id doesn't belong to either source.
+ */
+async function findExternalSessionFile(sessionId: string): Promise<
+  { source: 'codex' | 'hermes'; path: string } | null
+> {
+  const all = await sessionSources.listExternalSessions()
+  const hit = all.find(s => s.session_id === sessionId)
+  if (!hit) return null
+  return { source: hit.source as 'codex' | 'hermes', path: hit.file_path }
 }
 
 // ── Session summarizer (OpenRouter API) ──────────────────────────────────
